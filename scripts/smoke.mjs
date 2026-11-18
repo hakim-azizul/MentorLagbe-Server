@@ -1,7 +1,10 @@
 import "dotenv/config";
+import { createHmac } from "node:crypto";
 import { MongoClient, ObjectId } from "mongodb";
 
 const API = "http://localhost:5000";
+// Better Auth (Next.js) issues the JWTs — same origin as JWT_ISSUER.
+const AUTH = (process.env.JWT_ISSUER || "http://localhost:3000").replace(/\/+$/, "");
 const STUDENT_EMAIL = "goza@indo.com";
 const ADMIN_EMAIL = "smoke-admin@local.test";
 const TUTOR_EMAIL = "smoke-tutor@local.test";
@@ -9,6 +12,8 @@ const TUTOR2_EMAIL = "smoke-tutor2@local.test";
 const TARGET_EMAIL = "smoke-target@local.test";
 const TEST_PREFIX = "[SMOKE]";
 
+// Session fixtures inserted into the `session` collection; each one is traded
+// for a real JWT via `GET :3000/api/auth/token` (see mintJwt).
 const ADMIN_TOKEN = "smoketestadmintoken0123456789ab";
 const TUTOR_TOKEN = "smoketesttutortoken0123456789abc";
 const TUTOR2_TOKEN = "smoketesttutor2token0123456789abc";
@@ -26,12 +31,50 @@ function check(name, condition, detail = "") {
   }
 }
 
-async function call(path, { method = "GET", token, body } = {}) {
+/**
+ * Signs a session token the way Better Auth signs its cookie
+ * (`<token>.<base64 HMAC-SHA256(BETTER_AUTH_SECRET, token)>`), then trades
+ * the cookie for the JWT that mentor-server expects as `Bearer <jwt>`.
+ * Requires the Next.js dev server on :3000 — fails loudly when it is down.
+ */
+async function mintJwt(sessionToken) {
+  const secret = process.env.BETTER_AUTH_SECRET;
+  if (!secret) {
+    throw new Error("BETTER_AUTH_SECRET missing — cannot sign the session cookie.");
+  }
+  const signature = createHmac("sha256", secret).update(sessionToken).digest("base64");
+  const cookie = `better-auth.session_token=${sessionToken}.${signature}`;
+
+  let res;
+  try {
+    res = await fetch(`${AUTH}/api/auth/token`, {
+      headers: { Cookie: cookie },
+    });
+  } catch (error) {
+    throw new Error(
+      `Cannot reach ${AUTH}/api/auth/token — start the Next.js dev server ` +
+        `(npm run dev in mentor-client, port 3000) before running the smoke suite. ` +
+        `(${error.message})`
+    );
+  }
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body?.token) {
+    throw new Error(
+      `GET ${AUTH}/api/auth/token -> ${res.status} ${JSON.stringify(body)}. ` +
+        `Check that the Next.js dev server runs on port 3000 and that ` +
+        `BETTER_AUTH_SECRET matches between mentor-client/.env and mentor-server/.env.`
+    );
+  }
+  return body.token;
+}
+
+/** Sends a request to mentor-server with an optional `Authorization: Bearer`. */
+async function call(path, { method = "GET", jwt, body } = {}) {
   const res = await fetch(`${API}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Cookie: `better-auth.session_token=${token}` } : {}),
+      ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
       Origin: "http://localhost:3000",
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -89,10 +132,16 @@ async function main() {
     { token: STUDENT_TOKEN, userId: studentDoc._id, createdAt: new Date(), expiresAt },
   ]);
 
+  // Trade each fixture session for a real Better Auth JWT (Bearer for API calls).
+  const adminJwt = await mintJwt(ADMIN_TOKEN);
+  const tutorJwt = await mintJwt(TUTOR_TOKEN);
+  const tutor2Jwt = await mintJwt(TUTOR2_TOKEN);
+  const studentJwt = await mintJwt(STUDENT_TOKEN);
+
   const post = (n) =>
     call("/api/tuitions", {
       method: "POST",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: {
         title: `${TEST_PREFIX} Tuition ${n}`,
         subject: "Physics",
@@ -108,8 +157,34 @@ async function main() {
   try {
     // ---- auth ------------------------------------------------------------
     console.log("\nAUTH");
+    const jwksRes = await fetch(`${AUTH}/api/auth/jwks`);
+    const jwksBody = await jwksRes.json().catch(() => null);
+    check(
+      "GET :3000/api/auth/jwks exposes signing keys",
+      jwksRes.status === 200 &&
+        Array.isArray(jwksBody?.keys) &&
+        jwksBody.keys.length > 0,
+      `status ${jwksRes.status}`
+    );
+
     const noAuth = await call(`/api/dashboard/tutor/stats?email=${TUTOR_EMAIL}`);
-    check("401 without session cookie", noAuth.status === 401);
+    check("401 without Authorization header", noAuth.status === 401);
+
+    const garbage = await call(`/api/dashboard/tutor/stats?email=${TUTOR_EMAIL}`, {
+      jwt: "not-a-jwt.at-all",
+    });
+    check("401 with malformed token", garbage.status === 401, JSON.stringify(garbage.body));
+
+    const tamperedJwt = `${studentJwt.split(".").slice(0, 2).join(".")}.${"A".repeat(44)}`;
+    const tampered = await call(`/api/dashboard/tutor/stats?email=${TUTOR_EMAIL}`, {
+      jwt: tamperedJwt,
+    });
+    check("401 with tampered signature", tampered.status === 401, JSON.stringify(tampered.body));
+
+    const wrongRole = await call(`/api/tuitions/tutor?email=${STUDENT_EMAIL}`, {
+      jwt: studentJwt,
+    });
+    check("403 student token on tutor-only route", wrongRole.status === 403);
 
     // ---- tutor: tuition CRUD + free plan limit ---------------------------
     console.log("\nTUTOR TUITIONS");
@@ -132,14 +207,14 @@ async function main() {
 
     const invalidBody = await call("/api/tuitions", {
       method: "POST",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: { title: "x" },
     });
     check("POST with missing fields -> 400", invalidBody.status === 400);
 
     const badMode = await call("/api/tuitions", {
       method: "POST",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: {
         title: "x", subject: "y", classLevel: "z", mode: "Hybridish",
         monthlyFee: 1, daysPerWeek: 1, description: "d",
@@ -148,7 +223,7 @@ async function main() {
     check("POST invalid mode -> 400", badMode.status === 400);
 
     const list = await call(`/api/tuitions/tutor?email=${TUTOR_EMAIL}`, {
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check(
       "GET /api/tuitions/tutor returns my posts",
@@ -157,13 +232,13 @@ async function main() {
     );
 
     const wrongEmail = await call(`/api/tuitions/tutor?email=${STUDENT_EMAIL}`, {
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check("cross-account email -> 403", wrongEmail.status === 403);
 
     const patched = await call(`/api/tuitions/${t1.body._id}`, {
       method: "PATCH",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: { isActive: false, monthlyFee: 3000 },
     });
     check(
@@ -176,20 +251,20 @@ async function main() {
 
     const badPatch = await call(`/api/tuitions/${t1.body._id}`, {
       method: "PATCH",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: { isActive: "nope" },
     });
     check("PATCH non-boolean isActive -> 400", badPatch.status === 400);
 
     const foreignPatch = await call(`/api/tuitions/${t1.body._id}`, {
       method: "PATCH",
-      token: TUTOR2_TOKEN,
+      jwt: tutor2Jwt,
       body: { title: "hijacked" },
     });
     check("another tutor cannot edit my tuition -> 403", foreignPatch.status === 403);
 
     const stats = await call(`/api/dashboard/tutor/stats?email=${TUTOR_EMAIL}`, {
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check(
       "GET /api/dashboard/tutor/stats",
@@ -228,7 +303,7 @@ async function main() {
 
     const studentList = await call(
       `/api/applications/student?email=${STUDENT_EMAIL}`,
-      { token: STUDENT_TOKEN }
+      { jwt: studentJwt }
     );
     const joined = studentList.body?.find((a) => a._id === String(pendingId));
     check(
@@ -246,7 +321,7 @@ async function main() {
     );
 
     const tutorList = await call(`/api/applications/tutor?email=${TUTOR_EMAIL}`, {
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check(
       "GET /api/applications/tutor returns applicants",
@@ -256,13 +331,13 @@ async function main() {
 
     const cancelPending = await call(`/api/applications/${pendingId}`, {
       method: "DELETE",
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
     });
     check("DELETE pending application -> 200", cancelPending.status === 200);
 
     const studentStats = await call(
       `/api/dashboard/student/stats?email=${STUDENT_EMAIL}`,
-      { token: STUDENT_TOKEN }
+      { jwt: studentJwt }
     );
     check(
       "GET /api/dashboard/student/stats",
@@ -276,7 +351,7 @@ async function main() {
 
     const statusOk = await call(`/api/applications/${otherId}/status`, {
       method: "PATCH",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: { status: "accepted" },
     });
     check(
@@ -287,14 +362,14 @@ async function main() {
 
     const badStatus = await call(`/api/applications/${otherId}/status`, {
       method: "PATCH",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
       body: { status: "maybe" },
     });
     check("PATCH invalid status -> 400", badStatus.status === 400);
 
     const cancelAccepted = await call(`/api/applications/${otherId}`, {
       method: "DELETE",
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
     });
     check(
       "DELETE accepted application -> 400",
@@ -304,25 +379,25 @@ async function main() {
 
     const crossCancel = await call(`/api/applications/${otherId}`, {
       method: "DELETE",
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
     });
     check("student cancel of own app is status-guarded", crossCancel.status === 400);
 
     const tutorCantCancel = await call(`/api/applications/${otherId}`, {
       method: "DELETE",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check("tutor cannot cancel applications -> 403", tutorCantCancel.status === 403);
 
     const badId = await call("/api/applications/not-an-id", {
       method: "DELETE",
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
     });
     check("DELETE invalid id -> 400", badId.status === 400);
 
     const wrongTutorStatus = await call(`/api/applications/${otherId}/status`, {
       method: "PATCH",
-      token: TUTOR2_TOKEN,
+      jwt: tutor2Jwt,
       body: { status: "rejected" },
     });
     check(
@@ -334,26 +409,26 @@ async function main() {
     // ---- role guards -----------------------------------------------------
     console.log("\nROLE GUARDS");
     const asStudentAdmin = await call("/api/dashboard/admin/stats", {
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
     });
     check("student cannot read admin stats", asStudentAdmin.status === 403);
     const studentPosting = await call("/api/tuitions", {
       method: "POST",
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
       body: {
         title: "x", subject: "y", classLevel: "z", mode: "Online",
         monthlyFee: 1, daysPerWeek: 1, description: "d",
       },
     });
     check("student cannot post tuition", studentPosting.status === 403);
-    const tutorOnAdmin = await call("/api/admin/users", { token: TUTOR_TOKEN });
+    const tutorOnAdmin = await call("/api/admin/users", { jwt: tutorJwt });
     check("tutor cannot read admin users", tutorOnAdmin.status === 403);
-    const tutorOnAdminList = await call("/api/admin/tuitions", { token: TUTOR_TOKEN });
+    const tutorOnAdminList = await call("/api/admin/tuitions", { jwt: tutorJwt });
     check("tutor cannot read admin tuitions", tutorOnAdminList.status === 403);
 
     // ---- admin -----------------------------------------------------------
     console.log("\nADMIN");
-    const adminStats = await call("/api/dashboard/admin/stats", { token: ADMIN_TOKEN });
+    const adminStats = await call("/api/dashboard/admin/stats", { jwt: adminJwt });
     check(
       "GET /api/dashboard/admin/stats",
       adminStats.status === 200 &&
@@ -365,7 +440,7 @@ async function main() {
       JSON.stringify(adminStats.body)
     );
 
-    const allUsers = await call("/api/admin/users", { token: ADMIN_TOKEN });
+    const allUsers = await call("/api/admin/users", { jwt: adminJwt });
     check(
       "GET /api/admin/users",
       allUsers.status === 200 && allUsers.body?.length >= 4,
@@ -374,7 +449,7 @@ async function main() {
 
     const roleChange = await call(`/api/admin/users/${target._id}/role`, {
       method: "PATCH",
-      token: ADMIN_TOKEN,
+      jwt: adminJwt,
       body: { role: "tutor" },
     });
     check(
@@ -385,19 +460,19 @@ async function main() {
 
     const selfRole = await call(`/api/admin/users/${admin._id}/role`, {
       method: "PATCH",
-      token: ADMIN_TOKEN,
+      jwt: adminJwt,
       body: { role: "student" },
     });
     check("cannot change own role -> 400", selfRole.status === 400);
 
     const badRole = await call(`/api/admin/users/${target._id}/role`, {
       method: "PATCH",
-      token: ADMIN_TOKEN,
+      jwt: adminJwt,
       body: { role: "superuser" },
     });
     check("invalid role -> 400", badRole.status === 400);
 
-    const adminTuitions = await call("/api/admin/tuitions", { token: ADMIN_TOKEN });
+    const adminTuitions = await call("/api/admin/tuitions", { jwt: adminJwt });
     check(
       "GET /api/admin/tuitions",
       adminTuitions.status === 200 && adminTuitions.body?.length >= 2,
@@ -406,7 +481,7 @@ async function main() {
 
     const approval = await call(`/api/admin/tuitions/${t2.body._id}/approval`, {
       method: "PATCH",
-      token: ADMIN_TOKEN,
+      jwt: adminJwt,
       body: { approvalStatus: "approved" },
     });
     check(
@@ -417,13 +492,13 @@ async function main() {
 
     const badApproval = await call(`/api/admin/tuitions/${t2.body._id}/approval`, {
       method: "PATCH",
-      token: ADMIN_TOKEN,
+      jwt: adminJwt,
       body: { approvalStatus: "maybe" },
     });
     check("invalid approvalStatus -> 400", badApproval.status === 400);
 
     const approvedStats = await call(`/api/dashboard/tutor/stats?email=${TUTOR_EMAIL}`, {
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check(
       "approvedCount reflects approval",
@@ -431,7 +506,7 @@ async function main() {
       JSON.stringify(approvedStats.body)
     );
 
-    const transactions = await call("/api/admin/transactions", { token: ADMIN_TOKEN });
+    const transactions = await call("/api/admin/transactions", { jwt: adminJwt });
     check(
       "GET /api/admin/transactions -> array",
       transactions.status === 200 && Array.isArray(transactions.body),
@@ -442,7 +517,7 @@ async function main() {
     console.log("\nDELETE");
     const crossDelete = await call(`/api/tuitions/${t2.body._id}`, {
       method: "DELETE",
-      token: STUDENT_TOKEN,
+      jwt: studentJwt,
     });
     check("student cannot delete tuition -> 403", crossDelete.status === 403);
 
@@ -457,13 +532,13 @@ async function main() {
 
     const tutor2Delete = await call(`/api/tuitions/${t1.body._id}`, {
       method: "DELETE",
-      token: TUTOR2_TOKEN,
+      jwt: tutor2Jwt,
     });
     check("another tutor cannot delete my tuition -> 403", tutor2Delete.status === 403);
 
     const del = await call(`/api/tuitions/${t2.body._id}`, {
       method: "DELETE",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check("DELETE /api/tuitions/:id -> 200", del.status === 200, JSON.stringify(del.body));
 
@@ -475,7 +550,7 @@ async function main() {
 
     const unknown = await call(`/api/tuitions/${t2.body._id}`, {
       method: "DELETE",
-      token: TUTOR_TOKEN,
+      jwt: tutorJwt,
     });
     check("DELETE missing tuition -> 404", unknown.status === 404);
   } finally {

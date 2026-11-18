@@ -1,8 +1,14 @@
 /**
  * MentorLagbe — Express REST API (single file).
  *
- * Everything lives here: MongoDB access, Better Auth session middleware,
+ * Everything lives here: MongoDB access, Better Auth JWT verification (JWKS),
  * shared helpers, all route groups and the bootstrap. Database: `MentorLagbeDb`.
+ *
+ * Auth flow: mentor-client (Better Auth `jwt` plugin) fetches a session JWT
+ * (GET :3000/api/auth/token) and sends it as `Authorization: Bearer <jwt>`;
+ * `verifyToken` checks it against the JWKS (GET :3000/api/auth/jwks), syncs
+ * the user into MongoDB, attaches `req.user`, then a role gate
+ * (verifyStudent / verifyTutor / verifyAdmin) runs before the controller.
  *
  * Route groups:
  *   GET    /                        welcome
@@ -22,7 +28,7 @@
  *   /api/admin/*                     admin: users, tuitions, transactions
  */
 import "dotenv/config";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import express, { Router } from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
@@ -109,59 +115,37 @@ function escapeRegExp(value) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Better Auth session middleware                                              */
+/* Better Auth JWT verification (JWKS) + role middleware                                              */
 /* -------------------------------------------------------------------------- */
 
-/** Better Auth session cookie names (http + https prefixed variants). */
-const SESSION_COOKIE_NAMES = [
-  "better-auth.session_token",
-  "__Secure-better-auth.session_token",
-];
-
-/** Minimal cookie header parser (no extra dependency needed). */
-function parseCookies(cookieHeader = "") {
-  const jar = {};
-  for (const pair of cookieHeader.split(";")) {
-    const index = pair.indexOf("=");
-    if (index === -1) continue;
-    const key = pair.slice(0, index).trim();
-    const value = pair.slice(index + 1).trim();
-    if (!key) continue;
-    try {
-      jar[key] = decodeURIComponent(value);
-    } catch {
-      jar[key] = value;
-    }
-  }
-  return jar;
-}
-
 /**
- * Better Auth signs session cookies as `<token>.<base64 HMAC-SHA256(secret, token)>`.
- * The `session` collection stores only the raw token, so the signature must be
- * stripped before the lookup — and verified when BETTER_AUTH_SECRET is set,
- * so a tampered token can never be accepted.
+ * mentor-client hands the browser two credentials:
+ *   • HTTP-only session cookie → Next.js (/api/auth/*) — not read here
+ *   • JWT (GET :3000/api/auth/token) → sent here as `Authorization: Bearer <jwt>`
+ *
+ * The JWT is verified against the plugin's public key set
+ * (`GET :3000/api/auth/jwks`): signature, issuer, audience, expiry — so this
+ * server never needs the Better Auth secret. issuer/audience must match the
+ * `jwt({ ... })` options in mentor-client/src/lib/auth.ts; the env overrides
+ * below default to the same values as that file.
  */
-function unwrapSignedToken(value) {
-  const sigStart = value.lastIndexOf(".");
-  if (sigStart < 1) return { token: value, valid: true };
+const JWT_ISSUER = (
+  process.env.JWT_ISSUER ||
+  process.env.BETTER_AUTH_URL ||
+  "http://localhost:3000"
+).replace(/\/+$/, "");
+const JWT_AUDIENCE = (
+  process.env.JWT_AUDIENCE ||
+  `http://localhost:${process.env.PORT || 5000}`
+).replace(/\/+$/, "");
+const JWKS_URL = process.env.JWKS_URL || `${JWT_ISSUER}/api/auth/jwks`;
 
-  const token = value.slice(0, sigStart);
-  const signature = value.slice(sigStart + 1);
-
-  // Raw tokens never contain a dot; anything that does must carry a real signature.
-  if (signature.length !== 44 || !signature.endsWith("=")) {
-    return { token: value, valid: false };
-  }
-
-  const secret = process.env.BETTER_AUTH_SECRET;
-  if (!secret) return { token, valid: true };
-
-  const expected = createHmac("sha256", secret).update(token).digest("base64");
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
-  return { token, valid: a.length === b.length && timingSafeEqual(a, b) };
-}
+/** Remote JWK set — jose caches it (10 min) and throttles refetches (30 s). */
+const remoteJwks = createRemoteJWKSet(new URL(JWKS_URL), {
+  timeoutDuration: 5_000,
+  cooldownDuration: 30_000,
+  cacheMaxAge: 10 * 60_000,
+});
 
 function toObjectId(value) {
   if (value instanceof ObjectId) return value;
@@ -172,25 +156,50 @@ function toObjectId(value) {
 }
 
 /**
- * Resolves the signed-in Better Auth user from the `session` + `user`
- * collections. Returns `null` when the cookie is missing, expired or unknown.
+ * JWT claims → `users` document (created on first sight) → `req.user` shape.
+ *
+ * The database is authoritative for `role`/`plan`: an existing user's values
+ * are never overwritten from token claims, so demoting a user in the admin
+ * panel takes effect immediately even though their 15-minute JWT still
+ * carries the old role. Claims only seed the fields of a brand-new user.
  */
-async function getAuthUser(req) {
-  const cookies = parseCookies(req.headers.cookie || "");
-  const rawToken = SESSION_COOKIE_NAMES.map((name) => cookies[name]).find(Boolean);
-  if (!rawToken) return null;
+async function syncUserFromClaims(payload) {
+  const users = collections.users();
+  const userId = toObjectId(payload.sub);
+  const email = typeof payload.email === "string" ? payload.email.trim() : "";
 
-  const { token, valid } = unwrapSignedToken(rawToken);
-  if (!valid) return null;
+  let user = userId ? await users.findOne({ _id: userId }) : null;
+  if (!user && email) user = await users.findOne({ email });
 
-  const session = await collections.sessions().findOne({ token });
-  if (!session) return null;
-  if (session.expiresAt && new Date(session.expiresAt) < new Date()) return null;
+  if (!user) {
+    const now = new Date();
+    const fresh = {
+      _id: userId || new ObjectId(),
+      name: typeof payload.name === "string" ? payload.name : "",
+      email,
+      emailVerified: Boolean(payload.emailVerified),
+      image: typeof payload.image === "string" ? payload.image : "",
+      role: ["student", "tutor", "admin"].includes(payload.role)
+        ? payload.role
+        : "student",
+      phone: typeof payload.phone === "string" ? payload.phone : "",
+      bio: typeof payload.bio === "string" ? payload.bio : "",
+      plan: payload.plan === "pro" ? "pro" : "free",
+      createdAt: payload.createdAt ? new Date(payload.createdAt) : now,
+      updatedAt: now,
+    };
+    try {
+      await users.insertOne(fresh);
+      user = fresh;
+    } catch (error) {
+      // Two parallel requests created the same user — read the winner instead.
+      if (error?.code !== 11000) throw error;
+      user = userId
+        ? await users.findOne({ _id: userId })
+        : await users.findOne({ email });
+    }
+  }
 
-  const userId = toObjectId(session.userId);
-  const user = await collections
-    .users()
-    .findOne(userId ? { _id: userId } : { _id: session.userId });
   if (!user) return null;
 
   return {
@@ -203,30 +212,85 @@ async function getAuthUser(req) {
 }
 
 /**
- * requireRole("admin") | requireRole("student", "admin")
- * Attaches the resolved user to `req.user`.
+ * First guard on every protected route: `Authorization: Bearer <jwt>` →
+ * jose `jwtVerify` against the remote JWKS (signature + iss + aud + exp) →
+ * user sync → `req.user`.
+ *
+ * 401 = header missing, or token malformed / expired / tampered / wrong
+ *      issuer / wrong audience; 503 = JWKS unreachable (Next.js down).
  */
-function requireRole(...roles) {
-  return async (req, res, next) => {
-    try {
-      const user = await getAuthUser(req);
-      if (!user) {
-        return res
-          .status(401)
-          .json({ message: "You are not authenticated. Please sign in again." });
-      }
-      if (roles.length > 0 && !roles.includes(user.role)) {
-        return res
-          .status(403)
-          .json({ message: `Access denied. ${roles.join(" or ")} only.` });
-      }
-      req.user = user;
-      next();
-    } catch (error) {
-      next(error);
+async function verifyToken(req, res, next) {
+  try {
+    const [scheme, token] = String(req.headers.authorization || "").split(" ");
+    if (scheme !== "Bearer" || !token) {
+      return res
+        .status(401)
+        .json({ message: "You are not authenticated. Please sign in again." });
     }
+
+    let payload;
+    try {
+      ({ payload } = await jwtVerify(token, remoteJwks, {
+        issuer: JWT_ISSUER,
+        audience: JWT_AUDIENCE,
+      }));
+    } catch (error) {
+      const code = error?.code || "";
+      const badToken =
+        code.startsWith("ERR_JWT") ||
+        code.startsWith("ERR_JWS") ||
+        code === "ERR_JWKS_NO_MATCHING_KEY" ||
+        code === "ERR_JWKS_MULTIPLE_MATCHING_KEYS";
+      if (badToken) {
+        return res.status(401).json({
+          message: "Your session is invalid or expired. Please sign in again.",
+        });
+      }
+      // Not a token problem — JWKS fetch failed / timed out / non-200.
+      console.error("[auth] JWKS verification unavailable:", JWKS_URL, error);
+      return res.status(503).json({
+        message: "Authentication service is unavailable. Please try again.",
+      });
+    }
+
+    const user = await syncUserFromClaims(payload);
+    if (!user) {
+      return res
+        .status(401)
+        .json({ message: "You are not authenticated. Please sign in again." });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * Role gate — runs after `verifyToken` (which sets `req.user`):
+ * `verifyStudent` | `verifyTutor` | `verifyAdmin`.
+ * The student/tutor gates also admit admins (same contract as the old
+ * `requireRole("student", "admin")` helper).
+ */
+function verifyRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res
+        .status(401)
+        .json({ message: "You are not authenticated. Please sign in again." });
+    }
+    if (!roles.includes(req.user.role)) {
+      return res
+        .status(403)
+        .json({ message: `Access denied. ${roles.join(" or ")} only.` });
+    }
+    next();
   };
 }
+
+const verifyStudent = verifyRole("student", "admin");
+const verifyTutor = verifyRole("tutor", "admin");
+const verifyAdmin = verifyRole("admin");
 
 /**
  * When an endpoint is scoped by `?email=`, make sure the caller is not
@@ -287,7 +351,7 @@ const dashboardRouter = Router();
 /** GET /api/dashboard/student/stats?email= */
 dashboardRouter.get(
   "/student/stats",
-  requireRole("student", "admin"),
+  verifyToken, verifyStudent,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -318,7 +382,7 @@ dashboardRouter.get(
 /** GET /api/dashboard/tutor/stats?email= */
 dashboardRouter.get(
   "/tutor/stats",
-  requireRole("tutor", "admin"),
+  verifyToken, verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -352,7 +416,7 @@ dashboardRouter.get(
 );
 
 /** GET /api/dashboard/admin/stats */
-dashboardRouter.get("/admin/stats", requireRole("admin"), async (_req, res, next) => {
+dashboardRouter.get("/admin/stats", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const [totalUsers, totalTutors, pendingTuitions, approvedTuitions, revenue] =
       await Promise.all([
@@ -417,7 +481,7 @@ async function loadOwnTuition(req, res) {
 }
 
 /** POST /api/tuitions — creates a post with approvalStatus: 'pending'. */
-tuitionsRouter.post("/", requireRole("tutor", "admin"), async (req, res, next) => {
+tuitionsRouter.post("/", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const body = req.body || {};
     const required = [
@@ -523,7 +587,7 @@ tuitionsRouter.get("/", async (req, res, next) => {
 /** GET /api/tuitions/tutor?email= — every tuition created by this tutor. */
 tuitionsRouter.get(
   "/tutor",
-  requireRole("tutor", "admin"),
+  verifyToken, verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -581,7 +645,7 @@ tuitionsRouter.get("/:id", async (req, res, next) => {
 });
 
 /** PATCH /api/tuitions/:id — update details and/or toggle isActive. */
-tuitionsRouter.patch("/:id", requireRole("tutor", "admin"), async (req, res, next) => {
+tuitionsRouter.patch("/:id", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const tuition = await loadOwnTuition(req, res);
     if (!tuition) return;
@@ -642,7 +706,7 @@ tuitionsRouter.patch("/:id", requireRole("tutor", "admin"), async (req, res, nex
 });
 
 /** DELETE /api/tuitions/:id */
-tuitionsRouter.delete("/:id", requireRole("tutor", "admin"), async (req, res, next) => {
+tuitionsRouter.delete("/:id", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const tuition = await loadOwnTuition(req, res);
     if (!tuition) return;
@@ -790,7 +854,7 @@ applicationsRouter.post("/", async (req, res, next) => {
 /** GET /api/applications/student?email= — my applications (with tuition info). */
 applicationsRouter.get(
   "/student",
-  requireRole("student", "admin"),
+  verifyToken, verifyStudent,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -811,7 +875,7 @@ applicationsRouter.get(
 /** GET /api/applications/tutor?email= — applicants on my tuitions. */
 applicationsRouter.get(
   "/tutor",
-  requireRole("tutor", "admin"),
+  verifyToken, verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -840,7 +904,7 @@ applicationsRouter.get(
 /** PATCH /api/applications/:id/status — accept / reject an applicant. */
 applicationsRouter.patch(
   "/:id/status",
-  requireRole("tutor", "admin"),
+  verifyToken, verifyTutor,
   async (req, res, next) => {
     try {
       const _id = getObjectId(req, res);
@@ -881,7 +945,7 @@ applicationsRouter.patch(
 /** DELETE /api/applications/:id — student cancels a pending application. */
 applicationsRouter.delete(
   "/:id",
-  requireRole("student", "admin"),
+  verifyToken, verifyStudent,
   async (req, res, next) => {
     try {
       const _id = getObjectId(req, res);
@@ -924,7 +988,7 @@ const ROLES = ["student", "tutor", "admin"];
 const APPROVALS = ["approved", "rejected"];
 
 /** GET /api/admin/users — everyone registered on the platform. */
-adminRouter.get("/users", requireRole("admin"), async (_req, res, next) => {
+adminRouter.get("/users", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const users = await collections
       .users()
@@ -939,7 +1003,7 @@ adminRouter.get("/users", requireRole("admin"), async (_req, res, next) => {
 });
 
 /** PATCH /api/admin/users/:id/role — student | tutor | admin */
-adminRouter.patch("/users/:id/role", requireRole("admin"), async (req, res, next) => {
+adminRouter.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res, next) => {
   try {
     const _id = getObjectId(req, res);
     if (!_id) return;
@@ -970,7 +1034,7 @@ adminRouter.patch("/users/:id/role", requireRole("admin"), async (req, res, next
 });
 
 /** GET /api/admin/tuitions — every tuition post on the platform. */
-adminRouter.get("/tuitions", requireRole("admin"), async (_req, res, next) => {
+adminRouter.get("/tuitions", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const tuitions = await collections
       .tuitions()
@@ -987,7 +1051,7 @@ adminRouter.get("/tuitions", requireRole("admin"), async (_req, res, next) => {
 /** PATCH /api/admin/tuitions/:id/approval — approved | rejected */
 adminRouter.patch(
   "/tuitions/:id/approval",
-  requireRole("admin"),
+  verifyToken, verifyAdmin,
   async (req, res, next) => {
     try {
       const _id = getObjectId(req, res);
@@ -1017,7 +1081,7 @@ adminRouter.patch(
 );
 
 /** GET /api/admin/transactions — all Stripe payment records. */
-adminRouter.get("/transactions", requireRole("admin"), async (_req, res, next) => {
+adminRouter.get("/transactions", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const payments = await collections
       .payments()
