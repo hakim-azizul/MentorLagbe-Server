@@ -10,6 +10,8 @@
  * the user into MongoDB, attaches `req.user`, then a role gate
  * (verifyStudent / verifyTutor / verifyAdmin) runs before the controller.
  *
+ * Routes are registered directly on the Express `app` (no express.Router).
+ *
  * Route groups:
  *   GET    /                        welcome
  *   /api/dashboard/*                role stats (student | tutor | admin)
@@ -31,7 +33,7 @@
  */
 import "dotenv/config";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import express, { Router } from "express";
+import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 
@@ -348,11 +350,9 @@ app.get("/", (_req, res) => {
 /* Dashboard stats — GET /api/dashboard/{student|tutor|admin}/stats            */
 /* -------------------------------------------------------------------------- */
 
-const dashboardRouter = Router();
-
 /** GET /api/dashboard/student/stats?email= */
-dashboardRouter.get(
-  "/student/stats",
+app.get(
+  "/api/dashboard/student/stats",
   verifyToken, verifyStudent,
   requireSelfOrAdmin,
   async (req, res, next) => {
@@ -382,8 +382,8 @@ dashboardRouter.get(
 );
 
 /** GET /api/dashboard/tutor/stats?email= */
-dashboardRouter.get(
-  "/tutor/stats",
+app.get(
+  "/api/dashboard/tutor/stats",
   verifyToken, verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
@@ -418,7 +418,7 @@ dashboardRouter.get(
 );
 
 /** GET /api/dashboard/admin/stats */
-dashboardRouter.get("/admin/stats", verifyToken, verifyAdmin, async (_req, res, next) => {
+app.get("/api/dashboard/admin/stats", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const [totalUsers, totalTutors, pendingTuitions, approvedTuitions, revenue] =
       await Promise.all([
@@ -447,8 +447,6 @@ dashboardRouter.get("/admin/stats", verifyToken, verifyAdmin, async (_req, res, 
 /* -------------------------------------------------------------------------- */
 /* Tuitions — /api/tuitions                                                    */
 /* -------------------------------------------------------------------------- */
-
-const tuitionsRouter = Router();
 
 const MODES = ["Online", "Offline", "Hybrid"];
 
@@ -483,7 +481,7 @@ async function loadOwnTuition(req, res) {
 }
 
 /** POST /api/tuitions — creates a post with approvalStatus: 'pending'. */
-tuitionsRouter.post("/", verifyToken, verifyTutor, async (req, res, next) => {
+app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const body = req.body || {};
     const required = [
@@ -557,7 +555,7 @@ tuitionsRouter.post("/", verifyToken, verifyTutor, async (req, res, next) => {
  * Optional filters: `search` (case-insensitive regex on title/subject),
  * `subject`, `classLevel`, `mode`. Sorted newest first. No auth required.
  */
-tuitionsRouter.get("/", async (req, res, next) => {
+app.get("/api/tuitions", async (req, res, next) => {
   try {
     const { search, subject, classLevel, mode } = req.query;
 
@@ -587,8 +585,8 @@ tuitionsRouter.get("/", async (req, res, next) => {
 });
 
 /** GET /api/tuitions/tutor?email= — every tuition created by this tutor. */
-tuitionsRouter.get(
-  "/tutor",
+app.get(
+  "/api/tuitions/tutor",
   verifyToken, verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
@@ -614,7 +612,7 @@ tuitionsRouter.get(
  * summary (`name`, `email`, `image`, `bio`, `plan`) from the `user` collection.
  * Registered after `/tutor` so that literal path keeps winning.
  */
-tuitionsRouter.get("/:id", async (req, res, next) => {
+app.get("/api/tuitions/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
     if (!/^[a-f\d]{24}$/i.test(id)) {
@@ -647,7 +645,7 @@ tuitionsRouter.get("/:id", async (req, res, next) => {
 });
 
 /** PATCH /api/tuitions/:id — update details and/or toggle isActive. */
-tuitionsRouter.patch("/:id", verifyToken, verifyTutor, async (req, res, next) => {
+app.patch("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const tuition = await loadOwnTuition(req, res);
     if (!tuition) return;
@@ -708,7 +706,7 @@ tuitionsRouter.patch("/:id", verifyToken, verifyTutor, async (req, res, next) =>
 });
 
 /** DELETE /api/tuitions/:id */
-tuitionsRouter.delete("/:id", verifyToken, verifyTutor, async (req, res, next) => {
+app.delete("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const tuition = await loadOwnTuition(req, res);
     if (!tuition) return;
@@ -731,8 +729,6 @@ tuitionsRouter.delete("/:id", verifyToken, verifyTutor, async (req, res, next) =
 /* -------------------------------------------------------------------------- */
 /* Applications — /api/applications                                            */
 /* -------------------------------------------------------------------------- */
-
-const applicationsRouter = Router();
 
 const STATUSES = ["pending", "accepted", "rejected"];
 
@@ -782,7 +778,7 @@ async function withTuitionDetails(applications) {
  * GET /api/applications/check?tuitionId=&email= — instant "already applied?"
  * helper for the public tuition details page. No auth required.
  */
-applicationsRouter.get("/check", async (req, res, next) => {
+app.get("/api/applications/check", async (req, res, next) => {
   try {
     const tuitionId = String(req.query.tuitionId ?? "").trim();
     const email = String(req.query.email ?? "").trim().toLowerCase();
@@ -807,7 +803,7 @@ applicationsRouter.get("/check", async (req, res, next) => {
  * The session cookie is not required: the applicant's role is verified against
  * the `user` collection using the submitted `studentEmail`.
  */
-applicationsRouter.post("/", async (req, res, next) => {
+app.post("/api/applications", async (req, res, next) => {
   try {
     const body = req.body || {};
     const missing = missingFields(body, APPLICATION_FIELDS);
@@ -854,8 +850,8 @@ applicationsRouter.post("/", async (req, res, next) => {
 });
 
 /** GET /api/applications/student?email= — my applications (with tuition info). */
-applicationsRouter.get(
-  "/student",
+app.get(
+  "/api/applications/student",
   verifyToken, verifyStudent,
   requireSelfOrAdmin,
   async (req, res, next) => {
@@ -875,8 +871,8 @@ applicationsRouter.get(
 );
 
 /** GET /api/applications/tutor?email= — applicants on my tuitions. */
-applicationsRouter.get(
-  "/tutor",
+app.get(
+  "/api/applications/tutor",
   verifyToken, verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
@@ -904,8 +900,8 @@ applicationsRouter.get(
 );
 
 /** PATCH /api/applications/:id/status — accept / reject an applicant. */
-applicationsRouter.patch(
-  "/:id/status",
+app.patch(
+  "/api/applications/:id/status",
   verifyToken, verifyTutor,
   async (req, res, next) => {
     try {
@@ -945,8 +941,8 @@ applicationsRouter.patch(
 );
 
 /** DELETE /api/applications/:id — student cancels a pending application. */
-applicationsRouter.delete(
-  "/:id",
+app.delete(
+  "/api/applications/:id",
   verifyToken, verifyStudent,
   async (req, res, next) => {
     try {
@@ -984,8 +980,6 @@ applicationsRouter.delete(
 /* Profile — /api/profile (any authenticated role, no role gate)              */
 /* -------------------------------------------------------------------------- */
 
-const profileRouter = Router();
-
 /** Shape sent to the client: the editable tUserEdit fields + display context. */
 function toProfileDoc(user) {
   return {
@@ -1002,7 +996,7 @@ function toProfileDoc(user) {
 }
 
 /** GET /api/profile — the caller's own document (phone/bio are not in the session). */
-profileRouter.get("/", verifyToken, async (req, res, next) => {
+app.get("/api/profile", verifyToken, async (req, res, next) => {
   try {
     const user = await collections
       .users()
@@ -1022,7 +1016,7 @@ profileRouter.get("/", verifyToken, async (req, res, next) => {
  * cannot be escalated through this endpoint. A changed email is checked for
  * uniqueness (case-insensitive, excluding this user) before saving.
  */
-profileRouter.patch("/", verifyToken, async (req, res, next) => {
+app.patch("/api/profile", verifyToken, async (req, res, next) => {
   try {
     const body = req.body || {};
     const users = collections.users();
@@ -1077,13 +1071,11 @@ profileRouter.patch("/", verifyToken, async (req, res, next) => {
 /* Admin — /api/admin                                                          */
 /* -------------------------------------------------------------------------- */
 
-const adminRouter = Router();
-
 const ROLES = ["student", "tutor", "admin"];
 const APPROVALS = ["approved", "rejected"];
 
 /** GET /api/admin/users — everyone registered on the platform. */
-adminRouter.get("/users", verifyToken, verifyAdmin, async (_req, res, next) => {
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const users = await collections
       .users()
@@ -1098,7 +1090,7 @@ adminRouter.get("/users", verifyToken, verifyAdmin, async (_req, res, next) => {
 });
 
 /** PATCH /api/admin/users/:id/role — student | tutor | admin */
-adminRouter.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res, next) => {
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res, next) => {
   try {
     const _id = getObjectId(req, res);
     if (!_id) return;
@@ -1129,7 +1121,7 @@ adminRouter.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res, 
 });
 
 /** GET /api/admin/tuitions — every tuition post on the platform. */
-adminRouter.get("/tuitions", verifyToken, verifyAdmin, async (_req, res, next) => {
+app.get("/api/admin/tuitions", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const tuitions = await collections
       .tuitions()
@@ -1144,8 +1136,8 @@ adminRouter.get("/tuitions", verifyToken, verifyAdmin, async (_req, res, next) =
 });
 
 /** PATCH /api/admin/tuitions/:id/approval — approved | rejected */
-adminRouter.patch(
-  "/tuitions/:id/approval",
+app.patch(
+  "/api/admin/tuitions/:id/approval",
   verifyToken, verifyAdmin,
   async (req, res, next) => {
     try {
@@ -1176,7 +1168,7 @@ adminRouter.patch(
 );
 
 /** GET /api/admin/transactions — all Stripe payment records. */
-adminRouter.get("/transactions", verifyToken, verifyAdmin, async (_req, res, next) => {
+app.get("/api/admin/transactions", verifyToken, verifyAdmin, async (_req, res, next) => {
   try {
     const payments = await collections
       .payments()
@@ -1191,14 +1183,8 @@ adminRouter.get("/transactions", verifyToken, verifyAdmin, async (_req, res, nex
 });
 
 /* -------------------------------------------------------------------------- */
-/* Mount + fallbacks                                                           */
+/* 404 + error fallbacks (registered after every route)                        */
 /* -------------------------------------------------------------------------- */
-
-app.use("/api/dashboard", dashboardRouter);
-app.use("/api/tuitions", tuitionsRouter);
-app.use("/api/applications", applicationsRouter);
-app.use("/api/profile", profileRouter);
-app.use("/api/admin", adminRouter);
 
 // রাউট না পেলে
 app.use((_req, res) => {
