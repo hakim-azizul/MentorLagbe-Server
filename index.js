@@ -25,6 +25,8 @@
  *   GET    /api/applications/tutor    tutor: applicants on my tuitions
  *   PATCH  /api/applications/:id/status  tutor/admin: accept / reject
  *   DELETE /api/applications/:id     student: cancel a pending application
+ *   GET    /api/profile              authenticated: full profile for the edit form
+ *   PATCH  /api/profile              authenticated: update name/email/image/phone/bio
  *   /api/admin/*                     admin: users, tuitions, transactions
  */
 import "dotenv/config";
@@ -979,6 +981,99 @@ applicationsRouter.delete(
 );
 
 /* -------------------------------------------------------------------------- */
+/* Profile — /api/profile (any authenticated role, no role gate)              */
+/* -------------------------------------------------------------------------- */
+
+const profileRouter = Router();
+
+/** Shape sent to the client: the editable tUserEdit fields + display context. */
+function toProfileDoc(user) {
+  return {
+    _id: String(user._id),
+    name: user.name || "",
+    email: user.email || "",
+    image: user.image || "",
+    phone: user.phone || "",
+    bio: user.bio || "",
+    role: user.role || "student",
+    plan: user.plan || "free",
+    createdAt: user.createdAt || null,
+  };
+}
+
+/** GET /api/profile — the caller's own document (phone/bio are not in the session). */
+profileRouter.get("/", verifyToken, async (req, res, next) => {
+  try {
+    const user = await collections
+      .users()
+      .findOne({ _id: toObjectId(req.user.id) });
+    if (!user) return fail(res, 404, "User not found.");
+    res.json(toProfileDoc(user));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PATCH /api/profile — update the caller's own profile.
+ *
+ * Identity always comes from `verifyToken` (`req.user.id`), never the body,
+ * and only the whitelisted `tUserEdit` fields are written — so role/plan
+ * cannot be escalated through this endpoint. A changed email is checked for
+ * uniqueness (case-insensitive, excluding this user) before saving.
+ */
+profileRouter.patch("/", verifyToken, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const users = collections.users();
+    const userId = toObjectId(req.user.id);
+
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const email = typeof body.email === "string" ? body.email.trim() : "";
+    const image = typeof body.image === "string" ? body.image.trim() : "";
+    const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+    const bio = typeof body.bio === "string" ? body.bio.trim() : "";
+
+    const missing = missingFields({ name, email }, ["name", "email"]);
+    if (missing.length > 0) {
+      return fail(res, 400, `Please fill in: ${missing.join(", ")}`);
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return fail(res, 400, "Please provide a valid email address.");
+    }
+
+    const current = await users.findOne({ _id: userId });
+    if (!current) return fail(res, 404, "User not found.");
+
+    // ইমেইল বদলালে অন্য অ্যাকাউন্টের সাথে কনফ্লিক্ট করতে পারবে না (case-insensitive)
+    if (email.toLowerCase() !== String(current.email || "").toLowerCase()) {
+      const clash = await users.findOne({
+        email: { $regex: `^${escapeRegExp(email)}$`, $options: "i" },
+        _id: { $ne: userId },
+      });
+      if (clash) {
+        return fail(
+          res,
+          409,
+          "That email address is already in use by another account."
+        );
+      }
+    }
+
+    await users.updateOne(
+      { _id: userId },
+      { $set: { name, email, image, phone, bio, updatedAt: new Date() } }
+    );
+
+    const updated = await users.findOne({ _id: userId });
+    if (!updated) return fail(res, 404, "User not found.");
+    res.json(toProfileDoc(updated));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* -------------------------------------------------------------------------- */
 /* Admin — /api/admin                                                          */
 /* -------------------------------------------------------------------------- */
 
@@ -1102,6 +1197,7 @@ adminRouter.get("/transactions", verifyToken, verifyAdmin, async (_req, res, nex
 app.use("/api/dashboard", dashboardRouter);
 app.use("/api/tuitions", tuitionsRouter);
 app.use("/api/applications", applicationsRouter);
+app.use("/api/profile", profileRouter);
 app.use("/api/admin", adminRouter);
 
 // রাউট না পেলে

@@ -18,6 +18,7 @@ const ADMIN_TOKEN = "smoketestadmintoken0123456789ab";
 const TUTOR_TOKEN = "smoketesttutortoken0123456789abc";
 const TUTOR2_TOKEN = "smoketesttutor2token0123456789abc";
 const STUDENT_TOKEN = "smoketeststudenttoken0123456789";
+const TARGET_TOKEN = "smoketesttargettoken0123456789abc";
 
 let failures = 0;
 const client = new MongoClient(process.env.DB_URI);
@@ -130,6 +131,7 @@ async function main() {
     { token: TUTOR_TOKEN, userId: tutor._id, createdAt: new Date(), expiresAt },
     { token: TUTOR2_TOKEN, userId: tutor2._id, createdAt: new Date(), expiresAt },
     { token: STUDENT_TOKEN, userId: studentDoc._id, createdAt: new Date(), expiresAt },
+    { token: TARGET_TOKEN, userId: target._id, createdAt: new Date(), expiresAt },
   ]);
 
   // Trade each fixture session for a real Better Auth JWT (Bearer for API calls).
@@ -137,6 +139,7 @@ async function main() {
   const tutorJwt = await mintJwt(TUTOR_TOKEN);
   const tutor2Jwt = await mintJwt(TUTOR2_TOKEN);
   const studentJwt = await mintJwt(STUDENT_TOKEN);
+  const targetJwt = await mintJwt(TARGET_TOKEN);
 
   const post = (n) =>
     call("/api/tuitions", {
@@ -425,6 +428,99 @@ async function main() {
     check("tutor cannot read admin users", tutorOnAdmin.status === 403);
     const tutorOnAdminList = await call("/api/admin/tuitions", { jwt: tutorJwt });
     check("tutor cannot read admin tuitions", tutorOnAdminList.status === 403);
+
+    // ---- profile ---------------------------------------------------------
+    console.log("\nPROFILE");
+    const noProfileAuth = await call("/api/profile");
+    check("401 GET /api/profile without token", noProfileAuth.status === 401);
+
+    const ownProfile = await call("/api/profile", { jwt: targetJwt });
+    check(
+      "GET /api/profile -> own document",
+      ownProfile.status === 200 && ownProfile.body?.email === TARGET_EMAIL,
+      JSON.stringify(ownProfile.body)
+    );
+
+    const saveProfile = await call("/api/profile", {
+      method: "PATCH",
+      jwt: targetJwt,
+      body: {
+        name: "Smoke Target Renamed",
+        email: TARGET_EMAIL,
+        image: "https://i.ibb.co/smoke-avatar.png",
+        phone: "01711111111",
+        bio: "Updated by the smoke suite.",
+      },
+    });
+    check(
+      "PATCH /api/profile -> 200 with updated fields",
+      saveProfile.status === 200 &&
+        saveProfile.body?.name === "Smoke Target Renamed" &&
+        saveProfile.body?.phone === "01711111111" &&
+        saveProfile.body?.bio === "Updated by the smoke suite." &&
+        saveProfile.body?.image === "https://i.ibb.co/smoke-avatar.png",
+      JSON.stringify(saveProfile.body)
+    );
+
+    const rereadProfile = await call("/api/profile", { jwt: targetJwt });
+    check(
+      "PATCH persists (GET reflects changes)",
+      rereadProfile.status === 200 &&
+        rereadProfile.body?.name === "Smoke Target Renamed",
+      JSON.stringify(rereadProfile.body)
+    );
+
+    const emailClash = await call("/api/profile", {
+      method: "PATCH",
+      jwt: targetJwt,
+      body: {
+        name: "Smoke Target Renamed",
+        email: TUTOR_EMAIL,
+        image: "",
+        phone: "",
+        bio: "",
+      },
+    });
+    check(
+      "email used by another account -> 409",
+      emailClash.status === 409,
+      JSON.stringify(emailClash.body)
+    );
+
+    const badEmail = await call("/api/profile", {
+      method: "PATCH",
+      jwt: targetJwt,
+      body: { name: "x", email: "not-an-email", image: "", phone: "", bio: "" },
+    });
+    check("invalid email -> 400", badEmail.status === 400, JSON.stringify(badEmail.body));
+
+    const emptyName = await call("/api/profile", {
+      method: "PATCH",
+      jwt: targetJwt,
+      body: { name: "   ", email: TARGET_EMAIL, image: "", phone: "", bio: "" },
+    });
+    check("empty name -> 400", emptyName.status === 400);
+
+    const roleTamper = await call("/api/profile", {
+      method: "PATCH",
+      jwt: targetJwt,
+      body: {
+        name: "Smoke Target Renamed",
+        email: TARGET_EMAIL,
+        image: "",
+        phone: "",
+        bio: "",
+        role: "admin",
+        plan: "pro",
+      },
+    });
+    check(
+      "role/plan in body are ignored (whitelist)",
+      roleTamper.status === 200 &&
+        roleTamper.body?.role === "student" &&
+        roleTamper.body?.plan === "free",
+      JSON.stringify({ role: roleTamper.body?.role, plan: roleTamper.body?.plan })
+    );
 
     // ---- admin -----------------------------------------------------------
     console.log("\nADMIN");
