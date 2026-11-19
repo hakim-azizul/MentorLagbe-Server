@@ -15,7 +15,7 @@
  * Route groups:
  *   GET    /                        welcome
  *   /api/dashboard/*                role stats (student | tutor | admin)
- *   GET    /api/tuitions            public: approved & active tuitions (filterable)
+ *   GET    /api/tuitions            public: approved & active (filter + sort query params)
  *   GET    /api/tuitions/:id        public: single tuition + tutor summary
  *   POST   /api/tuitions            tutor/admin: create a tuition post
  *   GET    /api/tuitions/tutor       tutor/admin: my posts
@@ -450,6 +450,14 @@ app.get("/api/dashboard/admin/stats", verifyToken, verifyAdmin, async (_req, res
 
 const MODES = ["Online", "Offline", "Hybrid"];
 
+/** Whitelisted `sort` values for GET /api/tuitions — anything else = newest. */
+const TUITION_SORTS = {
+  newest: { createdAt: -1 },
+  oldest: { createdAt: 1 },
+  fee_asc: { monthlyFee: 1 },
+  fee_desc: { monthlyFee: -1 },
+};
+
 /** Fields a tutor may edit on their own tuition post. */
 const UPDATABLE_FIELDS = [
   "title",
@@ -478,6 +486,23 @@ async function loadOwnTuition(req, res) {
     return null;
   }
   return tuition;
+}
+
+/**
+ * Tutor profile summary attached to tuition payloads — the list
+ * (`GET /api/tuitions`) and the detail page (`GET /api/tuitions/:id`)
+ * share this exact shape, so cards and details render identically.
+ * Falls back to the denormalized fields stored on the tuition document
+ * when the tutor's user document is missing.
+ */
+function tutorSummary(tutorUser, tuition) {
+  return {
+    name: tutorUser?.name || tuition.tutorName || "",
+    email: tutorUser?.email || tuition.tutorEmail || "",
+    image: tutorUser?.image || "",
+    bio: tutorUser?.bio || "",
+    plan: tutorUser?.plan || "free",
+  };
 }
 
 /** POST /api/tuitions — creates a post with approvalStatus: 'pending'. */
@@ -552,12 +577,15 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
 
 /**
  * GET /api/tuitions — public catalogue of approved & active tuitions.
- * Optional filters: `search` (case-insensitive regex on title/subject),
- * `subject`, `classLevel`, `mode`. Sorted newest first. No auth required.
+ * Filters: `search` (case-insensitive regex on title/subject), `subject`,
+ * `classLevel`, `mode`. Sort: `sort` = newest | oldest | fee_asc | fee_desc
+ * (default newest), applied in the database query. No auth required.
+ * Every item carries a `tutor` profile summary (name, email, image, bio,
+ * plan) from the `user` collection — same shape as GET /api/tuitions/:id.
  */
 app.get("/api/tuitions", async (req, res, next) => {
   try {
-    const { search, subject, classLevel, mode } = req.query;
+    const { search, subject, classLevel, mode, sort } = req.query;
 
     const filter = { approvalStatus: "approved", isActive: true };
 
@@ -570,14 +598,36 @@ app.get("/api/tuitions", async (req, res, next) => {
     if (String(classLevel ?? "").trim()) filter.classLevel = String(classLevel).trim();
     if (String(mode ?? "").trim()) filter.mode = String(mode).trim();
 
+    const sortSpec =
+      TUITION_SORTS[String(sort ?? "").trim()] || TUITION_SORTS.newest;
+
     const tuitions = await collections
       .tuitions()
       .find(filter)
-      .sort({ createdAt: -1 })
+      .sort(sortSpec)
       .toArray();
 
+    // টিউশনার ইউজার ডকুমেন্ট একটিই কোয়েরিতে — কার্ডে অ্যাভাটার/নাম দেখানোর জন্য
+    const tutorEmails = [
+      ...new Set(tuitions.map((tuition) => tuition.tutorEmail).filter(Boolean)),
+    ];
+    const tutorDocs = tutorEmails.length
+      ? await collections
+          .users()
+          .find(
+            { email: { $in: tutorEmails } },
+            { projection: { email: 1, name: 1, image: 1, bio: 1, plan: 1 } }
+          )
+          .toArray()
+      : [];
+    const tutorByEmail = new Map(tutorDocs.map((doc) => [doc.email, doc]));
+
     res.json(
-      tuitions.map((tuition) => ({ ...tuition, _id: String(tuition._id) }))
+      tuitions.map((tuition) => ({
+        ...tuition,
+        _id: String(tuition._id),
+        tutor: tutorSummary(tutorByEmail.get(tuition.tutorEmail), tuition),
+      }))
     );
   } catch (error) {
     next(error);
@@ -624,20 +674,14 @@ app.get("/api/tuitions/:id", async (req, res, next) => {
 
     const tutorUser = await collections.users().findOne(
       { email: tuition.tutorEmail },
-      { projection: { _id: 0, name: 1, email: 1, image: 1, bio: 1, plan: 1 } }
+      { projection: { name: 1, email: 1, image: 1, bio: 1, plan: 1 } }
     );
 
+    // টিউশনের ডকুমেন্টে নাম থাকলেও প্রোফাইল সামারি ইউজার কালেকশন থেকেই আসে
     res.json({
       ...tuition,
       _id: String(tuition._id),
-      // টিউশনের ডকুমেন্টে নাম থাকলেও প্রোফাইল সামারি ইউজার কালেকশন থেকেই আসে
-      tutor: {
-        name: tutorUser?.name || tuition.tutorName || "",
-        email: tutorUser?.email || tuition.tutorEmail || "",
-        image: tutorUser?.image || "",
-        bio: tutorUser?.bio || "",
-        plan: tutorUser?.plan || "free",
-      },
+      tutor: tutorSummary(tutorUser, tuition),
     });
   } catch (error) {
     next(error);

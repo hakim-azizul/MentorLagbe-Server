@@ -609,6 +609,86 @@ async function main() {
       JSON.stringify(transactions.body)
     );
 
+    // ---- public list: filter/sort/tutor summary -------------------------
+    console.log("\nPUBLIC LIST");
+    const publicList = await call("/api/tuitions");
+    check(
+      "GET /api/tuitions -> approved + active only",
+      publicList.status === 200 &&
+        Array.isArray(publicList.body) &&
+        publicList.body.length >= 1 &&
+        publicList.body.every(
+          (tuition) =>
+            tuition.approvalStatus === "approved" && tuition.isActive === true
+        ),
+      JSON.stringify(publicList.body?.length)
+    );
+
+    const listed = publicList.body?.find(
+      (tuition) => tuition._id === String(t2.body._id)
+    );
+    check(
+      "list item carries the tutor profile summary",
+      typeof listed?.tutor?.name === "string" &&
+        listed.tutor.name.length > 0 &&
+        listed.tutor.email === TUTOR_EMAIL,
+      JSON.stringify(listed?.tutor)
+    );
+
+    check(
+      "list item tutor.image is a string",
+      typeof listed?.tutor?.image === "string",
+      JSON.stringify(listed?.tutor?.image)
+    );
+
+    const smokeSearch = await call("/api/tuitions?search=smoke");
+    check(
+      "search=smoke filters titles (case-insensitive)",
+      smokeSearch.status === 200 &&
+        smokeSearch.body?.length >= 1 &&
+        smokeSearch.body.every((tuition) => /smoke/i.test(tuition.title)),
+      JSON.stringify(smokeSearch.body?.map((tuition) => tuition.title))
+    );
+
+    const feeAsc = await call("/api/tuitions?sort=fee_asc");
+    check(
+      "sort=fee_asc -> monthlyFee ascending",
+      feeAsc.status === 200 &&
+        feeAsc.body?.length >= 1 &&
+        feeAsc.body.every(
+          (tuition, index) =>
+            index === 0 ||
+            feeAsc.body[index - 1].monthlyFee <= tuition.monthlyFee
+        ),
+      JSON.stringify(
+        feeAsc.body?.slice(0, 3).map((tuition) => tuition.monthlyFee)
+      )
+    );
+
+    const feeDesc = await call("/api/tuitions?sort=fee_desc");
+    check(
+      "sort=fee_desc -> monthlyFee descending",
+      feeDesc.status === 200 &&
+        feeDesc.body?.length >= 1 &&
+        feeDesc.body.every(
+          (tuition, index) =>
+            index === 0 ||
+            feeDesc.body[index - 1].monthlyFee >= tuition.monthlyFee
+        ),
+      JSON.stringify(
+        feeDesc.body?.slice(0, 3).map((tuition) => tuition.monthlyFee)
+      )
+    );
+
+    const bogusSort = await call("/api/tuitions?sort=bogus");
+    check(
+      "unknown sort falls back to newest",
+      bogusSort.status === 200 &&
+        bogusSort.body?.length === publicList.body?.length &&
+        bogusSort.body?.[0]?._id === publicList.body?.[0]?._id,
+      JSON.stringify(bogusSort.body?.[0]?._id)
+    );
+
     // ---- delete ----------------------------------------------------------
     console.log("\nDELETE");
     const crossDelete = await call(`/api/tuitions/${t2.body._id}`, {
