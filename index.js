@@ -29,12 +29,15 @@
  *   DELETE /api/applications/:id     student: cancel a pending application
  *   GET    /api/profile              authenticated: full profile for the edit form
  *   PATCH  /api/profile              authenticated: update name/email/image/phone/bio
+ *   POST   /payments/checkout-verify public: verify a Checkout Session + activate Pro
+ *   POST   /payments/webhook         Stripe webhook (raw body, signature verified)
  *   /api/admin/*                     admin: users, tuitions, transactions
  */
 import "dotenv/config";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import express from "express";
 import cors from "cors";
+import Stripe from "stripe";
 import { MongoClient, ObjectId } from "mongodb";
 
 /* -------------------------------------------------------------------------- */
@@ -118,6 +121,154 @@ function tuitionIdIn(ids) {
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+/** Optional `limit` query param → MongoDB `.limit()` value (0 = unlimited). */
+function parseLimit(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(parsed, 100);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Stripe                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Lazily creates the Stripe client so the API can still boot without Stripe
+ * credentials (smoke/e2e suites, tuitions-only deploys). Any route that
+ * actually needs Stripe throws a clear 500 instead of crashing on import.
+ */
+let stripeClient = null;
+
+function getStripe() {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  if (!secretKey) {
+    const error = new Error("STRIPE_SECRET_KEY is not configured.");
+    error.status = 500;
+    throw error;
+  }
+  if (!stripeClient) stripeClient = new Stripe(secretKey);
+  return stripeClient;
+}
+
+/** True for a 24-char hex string that can safely become a MongoDB ObjectId. */
+function isValidObjectId(value) {
+  return /^[a-f\d]{24}$/i.test(String(value ?? ""));
+}
+
+/**
+ * Single source of truth for "a paid Checkout Session upgraded this user".
+ * Used by both `POST /payments/checkout-verify` and the Stripe webhook, so a
+ * closed browser (webhook path) and a returned browser (verify path) produce
+ * the exact same database state.
+ *
+ * Idempotent: `payments.stripeSessionId` has a unique index and the write is an
+ * upsert, so replaying the same event never creates a second payment record.
+ *
+ * @returns {Promise<{ ok: true, duplicate: boolean, role: "student"|"tutor" }
+ *   | { ok: false, status: number, message: string }>}
+ */
+async function syncProPlan(session) {
+  const userId = String(session?.metadata?.userId ?? "").trim();
+
+  if (!isValidObjectId(userId)) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Checkout session is missing a valid userId.",
+    };
+  }
+
+  const user = await collections.users().findOne({ _id: new ObjectId(userId) });
+  if (!user) {
+    return {
+      ok: false,
+      status: 404,
+      message: "The user for this payment no longer exists.",
+    };
+  }
+
+  // Metadata role is authoritative (it picked the price); fall back to the
+  // stored role for older sessions created before role metadata existed.
+  const metadataRole = String(session?.metadata?.role ?? "").trim();
+  const role = ["student", "tutor"].includes(metadataRole)
+    ? metadataRole
+    : user.role;
+
+  if (role !== "student" && role !== "tutor") {
+    return {
+      ok: false,
+      status: 400,
+      message: "Pro plan is only available to students and tutors.",
+    };
+  }
+
+  const paymentIntentId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id;
+
+  const paymentDoc = {
+    userId,
+    userName: user.name || session.customer_details?.name || "MentorLagbe user",
+    userEmail:
+      user.email ||
+      session.customer_details?.email ||
+      session.customer_email ||
+      "",
+    userRole: role,
+    planName: "pro",
+    // Admin UI displays major units (e.g. 15, not 1500).
+    amount: Number(session.amount_total ?? 0) / 100,
+    currency: String(session.currency || "usd").toUpperCase(),
+    transactionId: paymentIntentId || session.id,
+    stripeSessionId: session.id,
+    paymentStatus: "paid",
+    paidAt: new Date((session.created ?? Math.floor(Date.now() / 1000)) * 1000),
+    createdAt: new Date(),
+  };
+
+  let duplicate = false;
+  try {
+    const result = await collections.payments().updateOne(
+      { stripeSessionId: session.id },
+      { $setOnInsert: paymentDoc },
+      { upsert: true },
+    );
+    duplicate = result.upsertedCount === 0;
+  } catch (error) {
+    // Unique index race between webhook + checkout-verify: already recorded.
+    if (error?.code === 11000) duplicate = true;
+    else throw error;
+  }
+
+  // Always (re)assert Pro — a retry must repair a partially failed first run.
+  await collections.users().updateOne(
+    { _id: new ObjectId(userId) },
+    { $set: { plan: "pro", updatedAt: new Date() } },
+  );
+
+  return { ok: true, duplicate, role };
+}
+
+/** Best-effort unique index so one Checkout Session can never be paid twice. */
+async function ensurePaymentIndexes() {
+  try {
+    await collections.payments().createIndex(
+      { stripeSessionId: 1 },
+      {
+        unique: true,
+        name: "uniq_stripeSessionId",
+        partialFilterExpression: { stripeSessionId: { $type: "string" } },
+      },
+    );
+  } catch (error) {
+    console.warn(
+      `[payments] Could not create unique stripeSessionId index: ${error.message}`,
+    );
+  }
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Better Auth JWT verification (JWKS) + role middleware                                              */
@@ -340,6 +491,68 @@ app.use(
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
   }),
+);
+
+/**
+ * POST /payments/webhook — Stripe server-to-server events.
+ *
+ * MUST be registered before `express.json()`: Stripe signs the exact raw
+ * request bytes, so signature verification needs the Buffer body.
+ */
+app.post(
+  "/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!signature) {
+      return res.status(400).json({ message: "Missing stripe-signature header." });
+    }
+    if (!webhookSecret) {
+      console.error("[stripe] STRIPE_WEBHOOK_SECRET is not configured.");
+      return res.status(500).json({ message: "Webhook secret is not configured." });
+    }
+
+    let event;
+    try {
+      event = getStripe().webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret,
+      );
+    } catch (error) {
+      console.error(
+        `[stripe] Webhook signature verification failed: ${error.message}`,
+      );
+      return res.status(400).json({ message: "Invalid webhook signature." });
+    }
+
+    try {
+      // `checkout.session.completed` covers cards; the async event covers
+      // delayed payment methods (e.g. bank debits) that settle later.
+      if (
+        event.type === "checkout.session.completed" ||
+        event.type === "checkout.session.async_payment_succeeded"
+      ) {
+        const session = event.data.object;
+        if (session.payment_status === "paid") {
+          const result = await syncProPlan(session);
+          if (!result.ok) {
+            console.error(
+              `[stripe] Could not activate Pro for session ${session.id}: ${result.message}`,
+            );
+          }
+        }
+      }
+    } catch (error) {
+      // Non-2xx makes Stripe retry the event later.
+      console.error(`[stripe] Webhook handler failed: ${error.message}`);
+      return res.status(500).json({ message: "Webhook handler failed." });
+    }
+
+    res.json({ received: true });
+  },
 );
 
 app.use(express.json({ limit: "1mb" }));
@@ -604,14 +817,15 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
 /**
  * GET /api/tuitions — public catalogue of approved & active tuitions.
  * Filters: `search` (case-insensitive regex on title/subject), `subject`,
- * `classLevel`, `mode`. Sort: `sort` = newest | oldest | fee_asc | fee_desc
+ * `classLevel`, `mode`. `limit` caps the result count (1–100, e.g. the home
+ * page's `limit=6`). Sort: `sort` = newest | oldest | fee_asc | fee_desc
  * (default newest), applied in the database query. No auth required.
  * Every item carries a `tutor` profile summary (name, email, image, bio,
  * plan) from the `user` collection — same shape as GET /api/tuitions/:id.
  */
 app.get("/api/tuitions", async (req, res, next) => {
   try {
-    const { search, subject, classLevel, mode, sort } = req.query;
+    const { search, subject, classLevel, mode, sort, limit } = req.query;
 
     const filter = { approvalStatus: "approved", isActive: true };
 
@@ -632,6 +846,7 @@ app.get("/api/tuitions", async (req, res, next) => {
       .tuitions()
       .find(filter)
       .sort(sortSpec)
+      .limit(parseLimit(limit))
       .toArray();
 
     // টিউশনার ইউজার ডকুমেন্ট একটিই কোয়েরিতে — কার্ডে অ্যাভাটার/নাম দেখানোর জন্য
@@ -1306,55 +1521,51 @@ app.get(
 );
 
 /* -------------------------------------------------------------------------- */
-/* payments with stripe related api's                       */
+/* Payments / Stripe                                                          */
 /* -------------------------------------------------------------------------- */
 
-app.post("/payments/checkout-verify", async (req, res) => {
-  const { sessionId } = req.body;
+/**
+ * POST /payments/checkout-verify — browser call from `/checkout/success`.
+ *
+ * Verifies the Checkout Session directly with Stripe (never trusts the client)
+ * and converges on the same `syncProPlan()` write as the webhook, so whichever
+ * arrives first activates Pro and the second is a no-op (`duplicate: true`).
+ */
+app.post("/payments/checkout-verify", async (req, res, next) => {
+  try {
+    const sessionId = String(req.body?.sessionId ?? "").trim();
 
-  if (!sessionId) {
-    return res.send({ success: false, message: "Session ID is required" });
-  }
+    if (!sessionId) return fail(res, 400, "sessionId is required.");
 
-  const { status, payment_status, customer_email, metadata, payment_intent } =
-    await stripe.checkout.sessions.retrieve(sessionId);
-
-  // 1. is used new session
-  // 2. check is the session id for the currently logged in user
-  // 3. insert sessionId into the payment Collection
-  // 4. update user information as premium user
-
-  if (status === "complete" && payment_status === "paid") {
-    const sessionQuery = { sessionId };
-    const existingPayment = await payments.findOne(sessionQuery);
-    if (existingPayment) {
-      return res.send({ success: false, message: "Payment already verified" });
+    let session;
+    try {
+      session = await getStripe().checkout.sessions.retrieve(sessionId);
+    } catch (error) {
+      if (error?.code === "resource_missing") {
+        return fail(res, 404, "Checkout session not found.");
+      }
+      throw error;
     }
-    const payment = {
-      sessionId,
-      status,
-      payment_status,
-      customer_email,
-      userId: metadata.userId,
-      payment_date: new Date(),
-      payment_intent,
-    };
 
-    const result = await payments.insertOne(payment);
+    if (session.status !== "complete" || session.payment_status !== "paid") {
+      return fail(res, 400, "Checkout is not complete or has not been paid.");
+    }
 
-    // update the user table
-    const query = { _id: new ObjectId(metadata.userId) };
+    const result = await syncProPlan(session);
+    if (!result.ok) return fail(res, result.status, result.message);
 
-    const updatedDoc = {
-      $set: {
-        premium: true,
-      },
-    };
-    const updateResult = await users.updateOne(query, updatedDoc);
-    res.send({ success: true, result, updateResult });
-    return;
+    res.json({
+      success: true,
+      duplicate: result.duplicate,
+      plan: "pro",
+      role: result.role,
+      message: result.duplicate
+        ? "Payment already verified — your Pro plan is active."
+        : "Payment verified — your Pro plan is now active.",
+    });
+  } catch (error) {
+    next(error);
   }
-  res.send({ success: false, message: "Payment verification failed" });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -1381,6 +1592,7 @@ app.use((err, _req, res, _next) => {
 const port = process.env.PORT || 5000;
 
 await connectToMongoDB();
+await ensurePaymentIndexes();
 
 app.listen(port, () => {
   console.log(`Server is running on port: ${port}`);
