@@ -108,7 +108,8 @@ function tuitionIdIn(ids) {
   const variants = [];
   for (const id of ids) {
     variants.push(String(id));
-    if (/^[a-f\d]{24}$/i.test(String(id))) variants.push(new ObjectId(String(id)));
+    if (/^[a-f\d]{24}$/i.test(String(id)))
+      variants.push(new ObjectId(String(id)));
   }
   return variants;
 }
@@ -139,8 +140,7 @@ const JWT_ISSUER = (
   "http://localhost:3000"
 ).replace(/\/+$/, "");
 const JWT_AUDIENCE = (
-  process.env.JWT_AUDIENCE ||
-  `http://localhost:${process.env.PORT || 5000}`
+  process.env.JWT_AUDIENCE || `http://localhost:${process.env.PORT || 5000}`
 ).replace(/\/+$/, "");
 const JWKS_URL = process.env.JWKS_URL || `${JWT_ISSUER}/api/auth/jwks`;
 
@@ -322,7 +322,9 @@ const allowedOrigins = (process.env.CLIENT_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
-const originAllowList = allowedOrigins.length ? allowedOrigins : DEFAULT_ORIGINS;
+const originAllowList = allowedOrigins.length
+  ? allowedOrigins
+  : DEFAULT_ORIGINS;
 
 const app = express();
 
@@ -337,7 +339,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-  })
+  }),
 );
 
 app.use(express.json({ limit: "1mb" }));
@@ -353,7 +355,8 @@ app.get("/", (_req, res) => {
 /** GET /api/dashboard/student/stats?email= */
 app.get(
   "/api/dashboard/student/stats",
-  verifyToken, verifyStudent,
+  verifyToken,
+  verifyStudent,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -365,8 +368,12 @@ app.get(
       const filter = { studentEmail: email };
       const [totalApplied, acceptedCount, pendingCount] = await Promise.all([
         collections.applications().countDocuments(filter),
-        collections.applications().countDocuments({ ...filter, status: "accepted" }),
-        collections.applications().countDocuments({ ...filter, status: "pending" }),
+        collections
+          .applications()
+          .countDocuments({ ...filter, status: "accepted" }),
+        collections
+          .applications()
+          .countDocuments({ ...filter, status: "pending" }),
       ]);
 
       res.json({
@@ -378,13 +385,14 @@ app.get(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /** GET /api/dashboard/tutor/stats?email= */
 app.get(
   "/api/dashboard/tutor/stats",
-  verifyToken, verifyTutor,
+  verifyToken,
+  verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -400,7 +408,10 @@ app.get(
           ...tuitionFilter,
           approvalStatus: "approved",
         }),
-        collections.tuitions().find(tuitionFilter, { projection: { _id: 1 } }).toArray(),
+        collections
+          .tuitions()
+          .find(tuitionFilter, { projection: { _id: 1 } })
+          .toArray(),
       ]);
 
       const tuitionIds = tuitionIdIn(tuitions.map((tuition) => tuition._id));
@@ -410,18 +421,32 @@ app.get(
           })
         : 0;
 
-      res.json({ totalPosted, approvedCount, totalApplicants, plan: user.plan || "free" });
+      res.json({
+        totalPosted,
+        approvedCount,
+        totalApplicants,
+        plan: user.plan || "free",
+      });
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /** GET /api/dashboard/admin/stats */
-app.get("/api/dashboard/admin/stats", verifyToken, verifyAdmin, async (_req, res, next) => {
-  try {
-    const [totalUsers, totalTutors, pendingTuitions, approvedTuitions, revenue] =
-      await Promise.all([
+app.get(
+  "/api/dashboard/admin/stats",
+  verifyToken,
+  verifyAdmin,
+  async (_req, res, next) => {
+    try {
+      const [
+        totalUsers,
+        totalTutors,
+        pendingTuitions,
+        approvedTuitions,
+        revenue,
+      ] = await Promise.all([
         collections.users().countDocuments(),
         collections.users().countDocuments({ role: "tutor" }),
         collections.tuitions().countDocuments({ approvalStatus: "pending" }),
@@ -432,17 +457,18 @@ app.get("/api/dashboard/admin/stats", verifyToken, verifyAdmin, async (_req, res
           .toArray(),
       ]);
 
-    res.json({
-      totalUsers,
-      totalTutors,
-      pendingTuitions,
-      approvedTuitions,
-      totalRevenue: revenue[0]?.total || 0,
-    });
-  } catch (error) {
-    next(error);
-  }
-});
+      res.json({
+        totalUsers,
+        totalTutors,
+        pendingTuitions,
+        approvedTuitions,
+        totalRevenue: revenue[0]?.total || 0,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 /* -------------------------------------------------------------------------- */
 /* Tuitions — /api/tuitions                                                    */
@@ -546,7 +572,7 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
       return fail(
         res,
         403,
-        "Free plan tutors can only post up to 2 tuitions. Upgrade to Pro for unlimited posts."
+        "Free plan tutors can only post up to 2 tuitions. Upgrade to Pro for unlimited posts.",
       );
     }
 
@@ -595,7 +621,8 @@ app.get("/api/tuitions", async (req, res, next) => {
       filter.$or = [{ title: pattern }, { subject: pattern }];
     }
     if (String(subject ?? "").trim()) filter.subject = String(subject).trim();
-    if (String(classLevel ?? "").trim()) filter.classLevel = String(classLevel).trim();
+    if (String(classLevel ?? "").trim())
+      filter.classLevel = String(classLevel).trim();
     if (String(mode ?? "").trim()) filter.mode = String(mode).trim();
 
     const sortSpec =
@@ -616,7 +643,7 @@ app.get("/api/tuitions", async (req, res, next) => {
           .users()
           .find(
             { email: { $in: tutorEmails } },
-            { projection: { email: 1, name: 1, image: 1, bio: 1, plan: 1 } }
+            { projection: { email: 1, name: 1, image: 1, bio: 1, plan: 1 } },
           )
           .toArray()
       : [];
@@ -627,7 +654,7 @@ app.get("/api/tuitions", async (req, res, next) => {
         ...tuition,
         _id: String(tuition._id),
         tutor: tutorSummary(tutorByEmail.get(tuition.tutorEmail), tuition),
-      }))
+      })),
     );
   } catch (error) {
     next(error);
@@ -637,7 +664,8 @@ app.get("/api/tuitions", async (req, res, next) => {
 /** GET /api/tuitions/tutor?email= — every tuition created by this tutor. */
 app.get(
   "/api/tuitions/tutor",
-  verifyToken, verifyTutor,
+  verifyToken,
+  verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -649,12 +677,12 @@ app.get(
         .toArray();
 
       res.json(
-        tuitions.map((tuition) => ({ ...tuition, _id: String(tuition._id) }))
+        tuitions.map((tuition) => ({ ...tuition, _id: String(tuition._id) })),
       );
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /**
@@ -669,13 +697,17 @@ app.get("/api/tuitions/:id", async (req, res, next) => {
       return fail(res, 404, "Tuition not found.");
     }
 
-    const tuition = await collections.tuitions().findOne({ _id: new ObjectId(id) });
+    const tuition = await collections
+      .tuitions()
+      .findOne({ _id: new ObjectId(id) });
     if (!tuition) return fail(res, 404, "Tuition not found.");
 
-    const tutorUser = await collections.users().findOne(
-      { email: tuition.tutorEmail },
-      { projection: { name: 1, email: 1, image: 1, bio: 1, plan: 1 } }
-    );
+    const tutorUser = await collections
+      .users()
+      .findOne(
+        { email: tuition.tutorEmail },
+        { projection: { name: 1, email: 1, image: 1, bio: 1, plan: 1 } },
+      );
 
     // টিউশনের ডকুমেন্টে নাম থাকলেও প্রোফাইল সামারি ইউজার কালেকশন থেকেই আসে
     res.json({
@@ -689,86 +721,96 @@ app.get("/api/tuitions/:id", async (req, res, next) => {
 });
 
 /** PATCH /api/tuitions/:id — update details and/or toggle isActive. */
-app.patch("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res, next) => {
-  try {
-    const tuition = await loadOwnTuition(req, res);
-    if (!tuition) return;
+app.patch(
+  "/api/tuitions/:id",
+  verifyToken,
+  verifyTutor,
+  async (req, res, next) => {
+    try {
+      const tuition = await loadOwnTuition(req, res);
+      if (!tuition) return;
 
-    const body = req.body || {};
-    const updates = {};
+      const body = req.body || {};
+      const updates = {};
 
-    for (const field of UPDATABLE_FIELDS) {
-      if (body[field] !== undefined) {
-        updates[field] =
-          typeof body[field] === "string" ? body[field].trim() : body[field];
+      for (const field of UPDATABLE_FIELDS) {
+        if (body[field] !== undefined) {
+          updates[field] =
+            typeof body[field] === "string" ? body[field].trim() : body[field];
+        }
       }
-    }
 
-    if (body.monthlyFee !== undefined) {
-      const fee = Number(body.monthlyFee);
-      if (!Number.isFinite(fee) || fee <= 0) {
-        return fail(res, 400, "Monthly fee must be a positive number.");
+      if (body.monthlyFee !== undefined) {
+        const fee = Number(body.monthlyFee);
+        if (!Number.isFinite(fee) || fee <= 0) {
+          return fail(res, 400, "Monthly fee must be a positive number.");
+        }
+        updates.monthlyFee = fee;
       }
-      updates.monthlyFee = fee;
-    }
-    if (body.daysPerWeek !== undefined) {
-      const days = Number(body.daysPerWeek);
-      if (!Number.isInteger(days) || days < 1 || days > 7) {
-        return fail(res, 400, "Days per week must be between 1 and 7.");
+      if (body.daysPerWeek !== undefined) {
+        const days = Number(body.daysPerWeek);
+        if (!Number.isInteger(days) || days < 1 || days > 7) {
+          return fail(res, 400, "Days per week must be between 1 and 7.");
+        }
+        updates.daysPerWeek = days;
       }
-      updates.daysPerWeek = days;
-    }
-    if (body.mode !== undefined && !MODES.includes(body.mode)) {
-      return fail(res, 400, "Mode must be Online, Offline or Hybrid.");
-    }
-    // isActive: true / false (status switch on the dashboard)
-    if (body.isActive !== undefined) {
-      if (typeof body.isActive !== "boolean") {
-        return fail(res, 400, "isActive must be true or false.");
+      if (body.mode !== undefined && !MODES.includes(body.mode)) {
+        return fail(res, 400, "Mode must be Online, Offline or Hybrid.");
       }
-      updates.isActive = body.isActive;
+      // isActive: true / false (status switch on the dashboard)
+      if (body.isActive !== undefined) {
+        if (typeof body.isActive !== "boolean") {
+          return fail(res, 400, "isActive must be true or false.");
+        }
+        updates.isActive = body.isActive;
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return fail(res, 400, "Nothing to update.");
+      }
+
+      updates.updatedAt = new Date();
+
+      const result = await collections
+        .tuitions()
+        .findOneAndUpdate(
+          { _id: tuition._id },
+          { $set: updates },
+          { returnDocument: "after" },
+        );
+
+      res.json({ ...result, _id: String(result._id) });
+    } catch (error) {
+      next(error);
     }
-
-    if (Object.keys(updates).length === 0) {
-      return fail(res, 400, "Nothing to update.");
-    }
-
-    updates.updatedAt = new Date();
-
-    const result = await collections
-      .tuitions()
-      .findOneAndUpdate(
-        { _id: tuition._id },
-        { $set: updates },
-        { returnDocument: "after" }
-      );
-
-    res.json({ ...result, _id: String(result._id) });
-  } catch (error) {
-    next(error);
-  }
-});
+  },
+);
 
 /** DELETE /api/tuitions/:id */
-app.delete("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res, next) => {
-  try {
-    const tuition = await loadOwnTuition(req, res);
-    if (!tuition) return;
+app.delete(
+  "/api/tuitions/:id",
+  verifyToken,
+  verifyTutor,
+  async (req, res, next) => {
+    try {
+      const tuition = await loadOwnTuition(req, res);
+      if (!tuition) return;
 
-    await collections.tuitions().deleteOne({ _id: tuition._id });
-    // টিউশন মুছে ফেললে তার পুরনো আবেদনগুলো এডার না রেখে মুছে ফেলা হচ্ছে
-    await collections.applications().deleteMany({
-      $or: [
-        { tuitionId: String(tuition._id) },
-        { tuitionId: new ObjectId(tuition._id) },
-      ],
-    });
+      await collections.tuitions().deleteOne({ _id: tuition._id });
+      // টিউশন মুছে ফেললে তার পুরনো আবেদনগুলো এডার না রেখে মুছে ফেলা হচ্ছে
+      await collections.applications().deleteMany({
+        $or: [
+          { tuitionId: String(tuition._id) },
+          { tuitionId: new ObjectId(tuition._id) },
+        ],
+      });
 
-    res.json({ message: "Tuition deleted successfully." });
-  } catch (error) {
-    next(error);
-  }
-});
+      res.json({ message: "Tuition deleted successfully." });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 /* -------------------------------------------------------------------------- */
 /* Applications — /api/applications                                            */
@@ -790,7 +832,7 @@ const APPLICATION_FIELDS = [
 async function withTuitionDetails(applications) {
   const ids = [
     ...new Set(
-      applications.map((app) => String(app.tuitionId)).filter((id) => id)
+      applications.map((app) => String(app.tuitionId)).filter((id) => id),
     ),
   ];
   const tuitions = ids.length
@@ -799,7 +841,9 @@ async function withTuitionDetails(applications) {
         .find({ _id: { $in: tuitionIdIn(ids) } })
         .toArray()
     : [];
-  const byId = new Map(tuitions.map((tuition) => [String(tuition._id), tuition]));
+  const byId = new Map(
+    tuitions.map((tuition) => [String(tuition._id), tuition]),
+  );
 
   return applications.map((application) => {
     const tuition = byId.get(String(application.tuitionId));
@@ -825,7 +869,9 @@ async function withTuitionDetails(applications) {
 app.get("/api/applications/check", async (req, res, next) => {
   try {
     const tuitionId = String(req.query.tuitionId ?? "").trim();
-    const email = String(req.query.email ?? "").trim().toLowerCase();
+    const email = String(req.query.email ?? "")
+      .trim()
+      .toLowerCase();
 
     if (!tuitionId || !email) {
       return fail(res, 400, "tuitionId and email are required.");
@@ -896,7 +942,8 @@ app.post("/api/applications", async (req, res, next) => {
 /** GET /api/applications/student?email= — my applications (with tuition info). */
 app.get(
   "/api/applications/student",
-  verifyToken, verifyStudent,
+  verifyToken,
+  verifyStudent,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -911,13 +958,14 @@ app.get(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /** GET /api/applications/tutor?email= — applicants on my tuitions. */
 app.get(
   "/api/applications/tutor",
-  verifyToken, verifyTutor,
+  verifyToken,
+  verifyTutor,
   requireSelfOrAdmin,
   async (req, res, next) => {
     try {
@@ -940,13 +988,14 @@ app.get(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /** PATCH /api/applications/:id/status — accept / reject an applicant. */
 app.patch(
   "/api/applications/:id/status",
-  verifyToken, verifyTutor,
+  verifyToken,
+  verifyTutor,
   async (req, res, next) => {
     try {
       const _id = getObjectId(req, res);
@@ -965,7 +1014,11 @@ app.patch(
       });
       if (!tuition) return fail(res, 404, "Tuition not found.");
       if (req.user.role !== "admin" && tuition.tutorEmail !== req.user.email) {
-        return fail(res, 403, "You are not allowed to update this application.");
+        return fail(
+          res,
+          403,
+          "You are not allowed to update this application.",
+        );
       }
 
       const updated = await collections
@@ -973,7 +1026,7 @@ app.patch(
         .findOneAndUpdate(
           { _id },
           { $set: { status, updatedAt: new Date() } },
-          { returnDocument: "after" }
+          { returnDocument: "after" },
         );
 
       const [result] = await withTuitionDetails([updated]);
@@ -981,13 +1034,14 @@ app.patch(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /** DELETE /api/applications/:id — student cancels a pending application. */
 app.delete(
   "/api/applications/:id",
-  verifyToken, verifyStudent,
+  verifyToken,
+  verifyStudent,
   async (req, res, next) => {
     try {
       const _id = getObjectId(req, res);
@@ -1000,16 +1054,16 @@ app.delete(
         req.user.role !== "admin" &&
         application.studentEmail !== req.user.email
       ) {
-        return fail(res, 403, "You are not allowed to cancel this application.");
+        return fail(
+          res,
+          403,
+          "You are not allowed to cancel this application.",
+        );
       }
 
       // শুধু pending আবেদন বাতিল করা যাবে
       if (application.status !== "pending") {
-        return fail(
-          res,
-          400,
-          "Only pending applications can be cancelled."
-        );
+        return fail(res, 400, "Only pending applications can be cancelled.");
       }
 
       await collections.applications().deleteOne({ _id });
@@ -1017,7 +1071,7 @@ app.delete(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /* -------------------------------------------------------------------------- */
@@ -1093,14 +1147,14 @@ app.patch("/api/profile", verifyToken, async (req, res, next) => {
         return fail(
           res,
           409,
-          "That email address is already in use by another account."
+          "That email address is already in use by another account.",
         );
       }
     }
 
     await users.updateOne(
       { _id: userId },
-      { $set: { name, email, image, phone, bio, updatedAt: new Date() } }
+      { $set: { name, email, image, phone, bio, updatedAt: new Date() } },
     );
 
     const updated = await users.findOne({ _id: userId });
@@ -1119,70 +1173,88 @@ const ROLES = ["student", "tutor", "admin"];
 const APPROVALS = ["approved", "rejected"];
 
 /** GET /api/admin/users — everyone registered on the platform. */
-app.get("/api/admin/users", verifyToken, verifyAdmin, async (_req, res, next) => {
-  try {
-    const users = await collections
-      .users()
-      .find({}, { projection: { emailVerified: 0, updatedAt: 0 } })
-      .sort({ createdAt: -1 })
-      .toArray();
+app.get(
+  "/api/admin/users",
+  verifyToken,
+  verifyAdmin,
+  async (_req, res, next) => {
+    try {
+      const users = await collections
+        .users()
+        .find({}, { projection: { emailVerified: 0, updatedAt: 0 } })
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.json(users.map((user) => ({ ...user, _id: String(user._id) })));
-  } catch (error) {
-    next(error);
-  }
-});
+      res.json(users.map((user) => ({ ...user, _id: String(user._id) })));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 /** PATCH /api/admin/users/:id/role — student | tutor | admin */
-app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res, next) => {
-  try {
-    const _id = getObjectId(req, res);
-    if (!_id) return;
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res, next) => {
+    try {
+      const _id = getObjectId(req, res);
+      if (!_id) return;
 
-    const { role } = req.body || {};
-    if (!ROLES.includes(role)) {
-      return fail(res, 400, "Role must be student, tutor or admin.");
+      const { role } = req.body || {};
+      if (!ROLES.includes(role)) {
+        return fail(res, 400, "Role must be student, tutor or admin.");
+      }
+      if (String(_id) === req.user.id) {
+        return fail(res, 400, "You cannot change your own role.");
+      }
+
+      const user = await collections.users().findOne({ _id });
+      if (!user) return fail(res, 404, "User not found.");
+
+      const updated = await collections
+        .users()
+        .findOneAndUpdate(
+          { _id },
+          { $set: { role } },
+          { returnDocument: "after" },
+        );
+
+      res.json({ ...updated, _id: String(updated._id) });
+    } catch (error) {
+      next(error);
     }
-    if (String(_id) === req.user.id) {
-      return fail(res, 400, "You cannot change your own role.");
-    }
-
-    const user = await collections.users().findOne({ _id });
-    if (!user) return fail(res, 404, "User not found.");
-
-    const updated = await collections
-      .users()
-      .findOneAndUpdate(
-        { _id },
-        { $set: { role } },
-        { returnDocument: "after" }
-      );
-
-    res.json({ ...updated, _id: String(updated._id) });
-  } catch (error) {
-    next(error);
-  }
-});
+  },
+);
 
 /** GET /api/admin/tuitions — every tuition post on the platform. */
-app.get("/api/admin/tuitions", verifyToken, verifyAdmin, async (_req, res, next) => {
-  try {
-    const tuitions = await collections
-      .tuitions()
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
+app.get(
+  "/api/admin/tuitions",
+  verifyToken,
+  verifyAdmin,
+  async (_req, res, next) => {
+    try {
+      const tuitions = await collections
+        .tuitions()
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.json(tuitions.map((tuition) => ({ ...tuition, _id: String(tuition._id) })));
-  } catch (error) {
-    next(error);
-  }
-});
+      res.json(
+        tuitions.map((tuition) => ({ ...tuition, _id: String(tuition._id) })),
+      );
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 /** PATCH /api/admin/tuitions/:id/approval — approved | rejected */
 app.patch(
   "/api/admin/tuitions/:id/approval",
-  verifyToken, verifyAdmin,
+  verifyToken,
+  verifyAdmin,
   async (req, res, next) => {
     try {
       const _id = getObjectId(req, res);
@@ -1201,29 +1273,88 @@ app.patch(
         .findOneAndUpdate(
           { _id },
           { $set: { approvalStatus, updatedAt: new Date() } },
-          { returnDocument: "after" }
+          { returnDocument: "after" },
         );
 
       res.json({ ...updated, _id: String(updated._id) });
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 /** GET /api/admin/transactions — all Stripe payment records. */
-app.get("/api/admin/transactions", verifyToken, verifyAdmin, async (_req, res, next) => {
-  try {
-    const payments = await collections
-      .payments()
-      .find({})
-      .sort({ paidAt: -1 })
-      .toArray();
+app.get(
+  "/api/admin/transactions",
+  verifyToken,
+  verifyAdmin,
+  async (_req, res, next) => {
+    try {
+      const payments = await collections
+        .payments()
+        .find({})
+        .sort({ paidAt: -1 })
+        .toArray();
 
-    res.json(payments.map((payment) => ({ ...payment, _id: String(payment._id) })));
-  } catch (error) {
-    next(error);
+      res.json(
+        payments.map((payment) => ({ ...payment, _id: String(payment._id) })),
+      );
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/* -------------------------------------------------------------------------- */
+/* payments with stripe related api's                       */
+/* -------------------------------------------------------------------------- */
+
+app.post("/payments/checkout-verify", async (req, res) => {
+  const { sessionId } = req.body;
+
+  if (!sessionId) {
+    return res.send({ success: false, message: "Session ID is required" });
   }
+
+  const { status, payment_status, customer_email, metadata, payment_intent } =
+    await stripe.checkout.sessions.retrieve(sessionId);
+
+  // 1. is used new session
+  // 2. check is the session id for the currently logged in user
+  // 3. insert sessionId into the payment Collection
+  // 4. update user information as premium user
+
+  if (status === "complete" && payment_status === "paid") {
+    const sessionQuery = { sessionId };
+    const existingPayment = await payments.findOne(sessionQuery);
+    if (existingPayment) {
+      return res.send({ success: false, message: "Payment already verified" });
+    }
+    const payment = {
+      sessionId,
+      status,
+      payment_status,
+      customer_email,
+      userId: metadata.userId,
+      payment_date: new Date(),
+      payment_intent,
+    };
+
+    const result = await payments.insertOne(payment);
+
+    // update the user table
+    const query = { _id: new ObjectId(metadata.userId) };
+
+    const updatedDoc = {
+      $set: {
+        premium: true,
+      },
+    };
+    const updateResult = await users.updateOne(query, updatedDoc);
+    res.send({ success: true, result, updateResult });
+    return;
+  }
+  res.send({ success: false, message: "Payment verification failed" });
 });
 
 /* -------------------------------------------------------------------------- */
