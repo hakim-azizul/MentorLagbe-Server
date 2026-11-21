@@ -1,39 +1,6 @@
-/**
- * MentorLagbe — Express REST API (single file).
- *
- * Everything lives here: MongoDB access, Better Auth JWT verification (JWKS),
- * shared helpers, all route groups and the bootstrap. Database: `MentorLagbeDb`.
- *
- * Auth flow: mentor-client (Better Auth `jwt` plugin) fetches a session JWT
- * (GET :3000/api/auth/token) and sends it as `Authorization: Bearer <jwt>`;
- * `verifyToken` checks it against the JWKS (GET :3000/api/auth/jwks), syncs
- * the user into MongoDB, attaches `req.user`, then a role gate
- * (verifyStudent / verifyTutor / verifyAdmin) runs before the controller.
- *
- * Routes are registered directly on the Express `app` (no express.Router).
- *
- * Route groups:
- *   GET    /                        welcome
- *   /api/dashboard/*                role stats (student | tutor | admin)
- *   GET    /api/tuitions            public: approved & active (filter + sort query params)
- *   GET    /api/tuitions/:id        public: single tuition + tutor summary
- *   POST   /api/tuitions            tutor/admin: create a tuition post
- *   GET    /api/tuitions/tutor       tutor/admin: my posts
- *   PATCH  /api/tuitions/:id         tutor/admin: edit / toggle isActive
- *   DELETE /api/tuitions/:id         tutor/admin: delete (+ its applications)
- *   GET    /api/applications/check   public: { hasApplied } helper
- *   POST   /api/applications         public: student applies (role checked by email)
- *   GET    /api/applications/student  student: my applications
- *   GET    /api/applications/tutor    tutor: applicants on my tuitions
- *   PATCH  /api/applications/:id/status  tutor/admin: accept / reject
- *   DELETE /api/applications/:id     student: cancel a pending application
- *   GET    /api/profile              authenticated: full profile for the edit form
- *   PATCH  /api/profile              authenticated: update name/email/image/phone/bio
- *   GET    /api/saved-tuitions       student: saved tuition list / saved ids / toggle
- *   POST   /payments/checkout-verify public: verify a Checkout Session + activate Pro
- *   POST   /payments/webhook         Stripe webhook (raw body, signature verified)
- *   /api/admin/*                     admin: users, tuitions, transactions
- */
+// MentorLagbe REST API — Express + MongoDB (MentorLagbeDb).
+// Routes are registered directly on `app`: setup -> auth -> domains -> fallbacks -> bootstrap.
+
 import "dotenv/config";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import express from "express";
@@ -41,9 +8,7 @@ import cors from "cors";
 import Stripe from "stripe";
 import { MongoClient, ObjectId } from "mongodb";
 
-/* -------------------------------------------------------------------------- */
-/* MongoDB                                                                     */
-/* -------------------------------------------------------------------------- */
+/* MongoDB */
 
 const DB_NAME = "MentorLagbeDb";
 
@@ -64,11 +29,6 @@ function getDb() {
   return client.db(DB_NAME);
 }
 
-/**
- * Better Auth (mongo adapter) stores auth data in singular collections:
- * `user`, `session`, `account`, `verification`.
- * Business data uses plural collections.
- */
 const collections = {
   users: () => getDb().collection("user"),
   sessions: () => getDb().collection("session"),
@@ -78,16 +38,12 @@ const collections = {
   savedTuitions: () => getDb().collection("saveduitions"),
 };
 
-/* -------------------------------------------------------------------------- */
-/* Shared helpers                                                              */
-/* -------------------------------------------------------------------------- */
+/* Shared helpers */
 
-/** Standard { message } error helper. */
 function fail(res, status, message) {
   return res.status(status).json({ message });
 }
 
-/** Reads and validates a MongoDB ObjectId from the route params. */
 function getObjectId(req, res) {
   const { id } = req.params;
   if (!/^[a-f\d]{24}$/i.test(id)) {
@@ -97,7 +53,6 @@ function getObjectId(req, res) {
   return new ObjectId(id);
 }
 
-/** Returns the list of missing keys from a request body. */
 function missingFields(body, fields) {
   return fields.filter((field) => {
     const value = body?.[field];
@@ -105,10 +60,6 @@ function missingFields(body, fields) {
   });
 }
 
-/**
- * `tuitionId` is stored as a string (see tApplication), but we also match the
- * ObjectId form so older/other writes keep working.
- */
 function tuitionIdIn(ids) {
   const variants = [];
   for (const id of ids) {
@@ -119,30 +70,19 @@ function tuitionIdIn(ids) {
   return variants;
 }
 
-/** Escapes user input before building a RegExp (public search filter). */
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/**
- * Positive integer query param with a safe default and ceiling.
- * Used by `GET /api/tuitions` for `page` and `limit`.
- */
 function positiveInt(value, fallback, max) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed < 1) return fallback;
   return Math.min(parsed, max);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Stripe                                                                      */
-/* -------------------------------------------------------------------------- */
+/* Stripe */
 
-/**
- * Lazily creates the Stripe client so the API can still boot without Stripe
- * credentials (smoke/e2e suites, tuitions-only deploys). Any route that
- * actually needs Stripe throws a clear 500 instead of crashing on import.
- */
+// Lazily create Stripe so the API boots without credentials; Stripe routes throw a clear 500.
 let stripeClient = null;
 
 function getStripe() {
@@ -156,23 +96,11 @@ function getStripe() {
   return stripeClient;
 }
 
-/** True for a 24-char hex string that can safely become a MongoDB ObjectId. */
 function isValidObjectId(value) {
   return /^[a-f\d]{24}$/i.test(String(value ?? ""));
 }
 
-/**
- * Single source of truth for "a paid Checkout Session upgraded this user".
- * Used by both `POST /payments/checkout-verify` and the Stripe webhook, so a
- * closed browser (webhook path) and a returned browser (verify path) produce
- * the exact same database state.
- *
- * Idempotent: `payments.stripeSessionId` has a unique index and the write is an
- * upsert, so replaying the same event never creates a second payment record.
- *
- * @returns {Promise<{ ok: true, duplicate: boolean, role: "student"|"tutor" }
- *   | { ok: false, status: number, message: string }>}
- */
+// Shared by verify + webhook; idempotent via unique payments.stripeSessionId.
 async function syncProPlan(session) {
   const userId = String(session?.metadata?.userId ?? "").trim();
 
@@ -193,8 +121,7 @@ async function syncProPlan(session) {
     };
   }
 
-  // Metadata role is authoritative (it picked the price); fall back to the
-  // stored role for older sessions created before role metadata existed.
+  // Metadata role is authoritative; stored role is a fallback for legacy sessions.
   const metadataRole = String(session?.metadata?.role ?? "").trim();
   const role = ["student", "tutor"].includes(metadataRole)
     ? metadataRole
@@ -223,7 +150,7 @@ async function syncProPlan(session) {
       "",
     userRole: role,
     planName: "pro",
-    // Admin UI displays major units (e.g. 15, not 1500).
+    // amount is stored in major units (15, not 1500).
     amount: Number(session.amount_total ?? 0) / 100,
     currency: String(session.currency || "usd").toUpperCase(),
     transactionId: paymentIntentId || session.id,
@@ -242,12 +169,12 @@ async function syncProPlan(session) {
     );
     duplicate = result.upsertedCount === 0;
   } catch (error) {
-    // Unique index race between webhook + checkout-verify: already recorded.
+    // Duplicate key = webhook/verify race; treat as already recorded.
     if (error?.code === 11000) duplicate = true;
     else throw error;
   }
 
-  // Always (re)assert Pro — a retry must repair a partially failed first run.
+  // Re-assert Pro so a replay repairs a partially failed first run.
   await collections.users().updateOne(
     { _id: new ObjectId(userId) },
     { $set: { plan: "pro", updatedAt: new Date() } },
@@ -256,7 +183,6 @@ async function syncProPlan(session) {
   return { ok: true, duplicate, role };
 }
 
-/** Best-effort unique index so one Checkout Session can never be paid twice. */
 async function ensurePaymentIndexes() {
   try {
     await collections.payments().createIndex(
@@ -274,7 +200,7 @@ async function ensurePaymentIndexes() {
   }
 }
 
-/** One bookmark per (student, tuition) — enforced by MongoDB, not just the API. */
+// One bookmark per student+tuition, enforced by MongoDB.
 async function ensureSavedTuitionIndexes() {
   try {
     await collections.savedTuitions().createIndex(
@@ -288,22 +214,8 @@ async function ensureSavedTuitionIndexes() {
   }
 }
 
+/* Better Auth JWT verification (JWKS) + role middleware */
 
-/* -------------------------------------------------------------------------- */
-/* Better Auth JWT verification (JWKS) + role middleware                                              */
-/* -------------------------------------------------------------------------- */
-
-/**
- * mentor-client hands the browser two credentials:
- *   • HTTP-only session cookie → Next.js (/api/auth/*) — not read here
- *   • JWT (GET :3000/api/auth/token) → sent here as `Authorization: Bearer <jwt>`
- *
- * The JWT is verified against the plugin's public key set
- * (`GET :3000/api/auth/jwks`): signature, issuer, audience, expiry — so this
- * server never needs the Better Auth secret. issuer/audience must match the
- * `jwt({ ... })` options in mentor-client/src/lib/auth.ts; the env overrides
- * below default to the same values as that file.
- */
 const JWT_ISSUER = (
   process.env.JWT_ISSUER ||
   process.env.BETTER_AUTH_URL ||
@@ -314,7 +226,6 @@ const JWT_AUDIENCE = (
 ).replace(/\/+$/, "");
 const JWKS_URL = process.env.JWKS_URL || `${JWT_ISSUER}/api/auth/jwks`;
 
-/** Remote JWK set — jose caches it (10 min) and throttles refetches (30 s). */
 const remoteJwks = createRemoteJWKSet(new URL(JWKS_URL), {
   timeoutDuration: 5_000,
   cooldownDuration: 30_000,
@@ -329,14 +240,7 @@ function toObjectId(value) {
   return null;
 }
 
-/**
- * JWT claims → `users` document (created on first sight) → `req.user` shape.
- *
- * The database is authoritative for `role`/`plan`: an existing user's values
- * are never overwritten from token claims, so demoting a user in the admin
- * panel takes effect immediately even though their 15-minute JWT still
- * carries the old role. Claims only seed the fields of a brand-new user.
- */
+// DB is authoritative for role/plan: token claims only seed brand-new users.
 async function syncUserFromClaims(payload) {
   const users = collections.users();
   const userId = toObjectId(payload.sub);
@@ -366,7 +270,7 @@ async function syncUserFromClaims(payload) {
       await users.insertOne(fresh);
       user = fresh;
     } catch (error) {
-      // Two parallel requests created the same user — read the winner instead.
+      // Duplicate-key race: another request created this user first.
       if (error?.code !== 11000) throw error;
       user = userId
         ? await users.findOne({ _id: userId })
@@ -385,14 +289,6 @@ async function syncUserFromClaims(payload) {
   };
 }
 
-/**
- * First guard on every protected route: `Authorization: Bearer <jwt>` →
- * jose `jwtVerify` against the remote JWKS (signature + iss + aud + exp) →
- * user sync → `req.user`.
- *
- * 401 = header missing, or token malformed / expired / tampered / wrong
- *      issuer / wrong audience; 503 = JWKS unreachable (Next.js down).
- */
 async function verifyToken(req, res, next) {
   try {
     const [scheme, token] = String(req.headers.authorization || "").split(" ");
@@ -420,7 +316,7 @@ async function verifyToken(req, res, next) {
           message: "Your session is invalid or expired. Please sign in again.",
         });
       }
-      // Not a token problem — JWKS fetch failed / timed out / non-200.
+      // Token problem vs JWKS fetch failure — the latter is a 503.
       console.error("[auth] JWKS verification unavailable:", JWKS_URL, error);
       return res.status(503).json({
         message: "Authentication service is unavailable. Please try again.",
@@ -440,12 +336,7 @@ async function verifyToken(req, res, next) {
   }
 }
 
-/**
- * Role gate — runs after `verifyToken` (which sets `req.user`):
- * `verifyStudent` | `verifyTutor` | `verifyAdmin`.
- * The student/tutor gates also admit admins (same contract as the old
- * `requireRole("student", "admin")` helper).
- */
+// Role gates run after verifyToken; student/tutor gates also admit admins.
 function verifyRole(...roles) {
   return (req, res, next) => {
     if (!req.user) {
@@ -466,10 +357,6 @@ const verifyStudent = verifyRole("student", "admin");
 const verifyTutor = verifyRole("tutor", "admin");
 const verifyAdmin = verifyRole("admin");
 
-/**
- * When an endpoint is scoped by `?email=`, make sure the caller is not
- * reading someone else's data (admins can read anything).
- */
 function requireSelfOrAdmin(req, res, next) {
   const requested = req.query.email;
   if (
@@ -482,11 +369,8 @@ function requireSelfOrAdmin(req, res, next) {
   next();
 }
 
-/* -------------------------------------------------------------------------- */
-/* App + CORS                                                                  */
-/* -------------------------------------------------------------------------- */
+/* App + CORS */
 
-/** Comma separated list of allowed browser origins (credentials enabled). */
 const DEFAULT_ORIGINS = ["http://localhost:3000", "http://localhost:5173"];
 const allowedOrigins = (process.env.CLIENT_ORIGINS || "")
   .split(",")
@@ -501,7 +385,6 @@ const app = express();
 app.use(
   cors({
     origin(origin, callback) {
-      // নন-ব্রাউজার রিকোয়েস্ট (Postman/curl) বা অনুমোদিত অরিজিন
       if (!origin || originAllowList.includes(origin)) {
         return callback(null, origin || false);
       }
@@ -509,7 +392,6 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    // Pagination metadata is also sent as headers for non-`meta=1` clients.
     exposedHeaders: [
       "X-Page",
       "X-Limit",
@@ -521,12 +403,7 @@ app.use(
   }),
 );
 
-/**
- * POST /payments/webhook — Stripe server-to-server events.
- *
- * MUST be registered before `express.json()`: Stripe signs the exact raw
- * request bytes, so signature verification needs the Buffer body.
- */
+// Webhook MUST precede express.json() — Stripe signs the exact raw bytes.
 app.post(
   "/payments/webhook",
   express.raw({ type: "application/json" }),
@@ -557,8 +434,6 @@ app.post(
     }
 
     try {
-      // `checkout.session.completed` covers cards; the async event covers
-      // delayed payment methods (e.g. bank debits) that settle later.
       if (
         event.type === "checkout.session.completed" ||
         event.type === "checkout.session.async_payment_succeeded"
@@ -574,7 +449,7 @@ app.post(
         }
       }
     } catch (error) {
-      // Non-2xx makes Stripe retry the event later.
+      // Non-2xx makes Stripe retry the event.
       console.error(`[stripe] Webhook handler failed: ${error.message}`);
       return res.status(500).json({ message: "Webhook handler failed." });
     }
@@ -589,11 +464,8 @@ app.get("/", (_req, res) => {
   res.send("Welcome to MentorLagbe server");
 });
 
-/* -------------------------------------------------------------------------- */
-/* Dashboard stats — GET /api/dashboard/{student|tutor|admin}/stats            */
-/* -------------------------------------------------------------------------- */
+/* Dashboard stats — GET /api/dashboard/{student|tutor|admin}/stats */
 
-/** GET /api/dashboard/student/stats?email= */
 app.get(
   "/api/dashboard/student/stats",
   verifyToken,
@@ -629,7 +501,6 @@ app.get(
   },
 );
 
-/** GET /api/dashboard/tutor/stats?email= */
 app.get(
   "/api/dashboard/tutor/stats",
   verifyToken,
@@ -674,7 +545,6 @@ app.get(
   },
 );
 
-/** GET /api/dashboard/admin/stats */
 app.get(
   "/api/dashboard/admin/stats",
   verifyToken,
@@ -711,13 +581,10 @@ app.get(
   },
 );
 
-/* -------------------------------------------------------------------------- */
-/* Tuitions — /api/tuitions                                                    */
-/* -------------------------------------------------------------------------- */
+/* Tuitions — /api/tuitions */
 
 const MODES = ["Online", "Offline", "Hybrid"];
 
-/** Whitelisted `sort` values for GET /api/tuitions — anything else = newest. */
 const TUITION_SORTS = {
   newest: { createdAt: -1 },
   oldest: { createdAt: 1 },
@@ -725,7 +592,6 @@ const TUITION_SORTS = {
   fee_desc: { monthlyFee: -1 },
 };
 
-/** Fields a tutor may edit on their own tuition post. */
 const UPDATABLE_FIELDS = [
   "title",
   "subject",
@@ -738,7 +604,6 @@ const UPDATABLE_FIELDS = [
   "bannerImage",
 ];
 
-/** Loads a tuition and makes sure the caller owns it (admins pass). */
 async function loadOwnTuition(req, res) {
   const _id = getObjectId(req, res);
   if (!_id) return null;
@@ -755,13 +620,6 @@ async function loadOwnTuition(req, res) {
   return tuition;
 }
 
-/**
- * Tutor profile summary attached to tuition payloads — the list
- * (`GET /api/tuitions`) and the detail page (`GET /api/tuitions/:id`)
- * share this exact shape, so cards and details render identically.
- * Falls back to the denormalized fields stored on the tuition document
- * when the tutor's user document is missing.
- */
 function tutorSummary(tutorUser, tuition) {
   return {
     name: tutorUser?.name || tuition.tutorName || "",
@@ -772,11 +630,6 @@ function tutorSummary(tutorUser, tuition) {
   };
 }
 
-/**
- * Hydrates saved-tuition docs into the same `tTuitionView` shape used by
- * `GET /api/tuitions`, so the dashboard can reuse the existing card layout.
- * Bookmarks pointing at deleted tuitions are silently dropped.
- */
 async function withSavedTuitionDetails(savedDocs) {
   const tuitionIds = [
     ...new Set(savedDocs.map((doc) => doc.tuition).filter(Boolean)),
@@ -817,7 +670,6 @@ async function withSavedTuitionDetails(savedDocs) {
   });
 }
 
-/** POST /api/tuitions — creates a post with approvalStatus: 'pending'. */
 app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -848,7 +700,7 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
       return fail(res, 400, "Days per week must be between 1 and 7.");
     }
 
-    // ফ্রি প্ল্যানে সর্বোচ্চ ২টি টিউশন পোস্ট করা যাবে
+    // Free plan: at most 2 tuition posts.
     const user = await collections.users().findOne({ email: req.user.email });
     const plan = user?.plan || "free";
     const posted = await collections.tuitions().countDocuments({
@@ -887,15 +739,7 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/tuitions — public catalogue of approved & active tuitions.
- * Filters: `search`, `subject`, `classLevel`, `mode`, `sort`.
- * Pagination: `page` (default 1) and `limit` (default 12, max 50).
- *
- * The body stays a plain array for backwards compatibility (FeaturedTuitions
- * calls `?limit=6`). `?meta=1` returns `{ items, ...pagination }` instead.
- * The same metadata is always exposed as CORS-readable `X-*` headers.
- */
+// GET /api/tuitions: array by default; ?meta=1 adds pagination; X-* headers always.
 app.get("/api/tuitions", async (req, res, next) => {
   try {
     const {
@@ -926,10 +770,9 @@ app.get("/api/tuitions", async (req, res, next) => {
 
     const limit = positiveInt(limitQuery, 12, 50);
     const totalItems = await collections.tuitions().countDocuments(filter);
-    // Keep page 1 valid even for an empty catalogue.
     const totalPages = Math.max(1, Math.ceil(totalItems / limit));
     const requestedPage = positiveInt(pageQuery, 1, Number.MAX_SAFE_INTEGER);
-    // Clamp an out-of-range page (e.g. stale ?page=9 after filtering) to the last page.
+    // Clamp stale out-of-range ?page to the last page.
     const page = Math.min(requestedPage, totalPages);
     const hasNextPage = page < totalPages;
     const hasPrevPage = page > 1;
@@ -942,7 +785,6 @@ app.get("/api/tuitions", async (req, res, next) => {
       .limit(limit)
       .toArray();
 
-    // টিউশনার ইউজার ডকুমেন্ট একটিই কোয়েরিতে — কার্ডে অ্যাভাটার/নাম দেখানোর জন্য
     const tutorEmails = [
       ...new Set(tuitions.map((tuition) => tuition.tutorEmail).filter(Boolean)),
     ];
@@ -989,7 +831,6 @@ app.get("/api/tuitions", async (req, res, next) => {
   }
 });
 
-/** GET /api/tuitions/tutor?email= — every tuition created by this tutor. */
 app.get(
   "/api/tuitions/tutor",
   verifyToken,
@@ -1013,11 +854,7 @@ app.get(
   },
 );
 
-/**
- * GET /api/tuitions/:id — public tuition details with the tutor's profile
- * summary (`name`, `email`, `image`, `bio`, `plan`) from the `user` collection.
- * Registered after `/tutor` so that literal path keeps winning.
- */
+// Keep /tutor registered before /:id so the literal path wins.
 app.get("/api/tuitions/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -1037,7 +874,6 @@ app.get("/api/tuitions/:id", async (req, res, next) => {
         { projection: { name: 1, email: 1, image: 1, bio: 1, plan: 1 } },
       );
 
-    // টিউশনের ডকুমেন্টে নাম থাকলেও প্রোফাইল সামারি ইউজার কালেকশন থেকেই আসে
     res.json({
       ...tuition,
       _id: String(tuition._id),
@@ -1048,7 +884,6 @@ app.get("/api/tuitions/:id", async (req, res, next) => {
   }
 });
 
-/** PATCH /api/tuitions/:id — update details and/or toggle isActive. */
 app.patch(
   "/api/tuitions/:id",
   verifyToken,
@@ -1085,7 +920,6 @@ app.patch(
       if (body.mode !== undefined && !MODES.includes(body.mode)) {
         return fail(res, 400, "Mode must be Online, Offline or Hybrid.");
       }
-      // isActive: true / false (status switch on the dashboard)
       if (body.isActive !== undefined) {
         if (typeof body.isActive !== "boolean") {
           return fail(res, 400, "isActive must be true or false.");
@@ -1114,7 +948,6 @@ app.patch(
   },
 );
 
-/** DELETE /api/tuitions/:id */
 app.delete(
   "/api/tuitions/:id",
   verifyToken,
@@ -1125,14 +958,12 @@ app.delete(
       if (!tuition) return;
 
       await collections.tuitions().deleteOne({ _id: tuition._id });
-      // টিউশন মুছে ফেললে তার পুরনো আবেদনগুলো এডার না রেখে মুছে ফেলা হচ্ছে
       await collections.applications().deleteMany({
         $or: [
           { tuitionId: String(tuition._id) },
           { tuitionId: new ObjectId(tuition._id) },
         ],
       });
-      // বুকমার্কও ওই টিউশনের সাথে মুছে ফেলা হয় — ঝুলে থাকা রেফারেন্স থাকবে না
       await collections.savedTuitions().deleteMany({ tuition: tuition._id });
 
       res.json({ message: "Tuition deleted successfully." });
@@ -1142,13 +973,10 @@ app.delete(
   },
 );
 
-/* -------------------------------------------------------------------------- */
-/* Applications — /api/applications                                            */
-/* -------------------------------------------------------------------------- */
+/* Applications — /api/applications */
 
 const STATUSES = ["pending", "accepted", "rejected"];
 
-/** Fields the public apply form must send (tApplication storage names below). */
 const APPLICATION_FIELDS = [
   "tuitionId",
   "studentEmail",
@@ -1158,7 +986,6 @@ const APPLICATION_FIELDS = [
   "note",
 ];
 
-/** Fills tuition based fields (title, tutor, fee) onto an application. */
 async function withTuitionDetails(applications) {
   const ids = [
     ...new Set(
@@ -1192,10 +1019,6 @@ async function withTuitionDetails(applications) {
   });
 }
 
-/**
- * GET /api/applications/check?tuitionId=&email= — instant "already applied?"
- * helper for the public tuition details page. No auth required.
- */
 app.get("/api/applications/check", async (req, res, next) => {
   try {
     const tuitionId = String(req.query.tuitionId ?? "").trim();
@@ -1218,12 +1041,6 @@ app.get("/api/applications/check", async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/applications — student applies for a tuition.
- * The session cookie is not required: the applicant's role is verified against
- * the `user` collection using the submitted `studentEmail`. The tuition is
- * looked up so the stored application carries the tutor link (`tutorEmail`).
- */
 app.post("/api/applications", async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -1235,19 +1052,17 @@ app.post("/api/applications", async (req, res, next) => {
     const tuitionId = String(body.tuitionId).trim();
     const studentEmail = String(body.studentEmail).trim().toLowerCase();
 
-    // শুধু student রোলের অ্যাকাউন্টই আবেদন করতে পারবে
     const student = await collections.users().findOne({ email: studentEmail });
     if (!student || student.role !== "student") {
       return fail(res, 403, "Only students can apply for tuitions.");
     }
 
-    // টিউশন ডকুমেন্ট থেকে টিউটরের লিংক ও ডিসপ্লে তথ্য নেওয়া হয়
+    // Tuition lookup supplies the tutor link and display fields.
     const tuition = await collections.tuitions().findOne({
       _id: { $in: tuitionIdIn([tuitionId]) },
     });
     if (!tuition) return fail(res, 404, "Tuition not found.");
 
-    // একই টিউশনে একজন শিক্ষার্থী একবারই আবেদন করতে পারবে
     const existing = await collections.applications().findOne({
       tuitionId: { $in: tuitionIdIn([tuitionId]) },
       studentEmail,
@@ -1281,7 +1096,6 @@ app.post("/api/applications", async (req, res, next) => {
   }
 });
 
-/** GET /api/applications/student?email= — my applications (with tuition info). */
 app.get(
   "/api/applications/student",
   verifyToken,
@@ -1303,7 +1117,6 @@ app.get(
   },
 );
 
-/** GET /api/applications/tutor?email= — applicants on my tuitions. */
 app.get(
   "/api/applications/tutor",
   verifyToken,
@@ -1333,7 +1146,6 @@ app.get(
   },
 );
 
-/** PATCH /api/applications/:id/status — accept / reject an applicant. */
 app.patch(
   "/api/applications/:id/status",
   verifyToken,
@@ -1379,7 +1191,6 @@ app.patch(
   },
 );
 
-/** DELETE /api/applications/:id — student cancels a pending application. */
 app.delete(
   "/api/applications/:id",
   verifyToken,
@@ -1403,7 +1214,7 @@ app.delete(
         );
       }
 
-      // শুধু pending আবেদন বাতিল করা যাবে
+      // Only pending applications may be cancelled.
       if (application.status !== "pending") {
         return fail(res, 400, "Only pending applications can be cancelled.");
       }
@@ -1416,17 +1227,11 @@ app.delete(
   },
 );
 
-/* -------------------------------------------------------------------------- */
-/* Saved tuitions — /api/saved-tuitions (authenticated students)              */
-/* -------------------------------------------------------------------------- */
+/* Saved tuitions — /api/saved-tuitions (authenticated students) */
 
-/** Free students get 5 bookmarks; Pro students are unlimited. */
+// Free students: 5 bookmarks; Pro: unlimited.
 const FREE_SAVED_TUITION_LIMIT = 5;
 
-/**
- * GET /api/saved-tuitions/ids — just the saved tuition ids for the caller.
- * Used on load so cards/details can render the active bookmarked state.
- */
 app.get(
   "/api/saved-tuitions/ids",
   verifyToken,
@@ -1448,10 +1253,6 @@ app.get(
   },
 );
 
-/**
- * GET /api/saved-tuitions — the caller's bookmarks, newest first, in the same
- * shape as GET /api/tuitions (plus `savedAt`). Deleted tuitions are filtered out.
- */
 app.get(
   "/api/saved-tuitions",
   verifyToken,
@@ -1474,10 +1275,7 @@ app.get(
   },
 );
 
-/**
- * POST /api/saved-tuitions/toggle — save or remove one bookmark.
- * The identity comes from the verified user, never from the request body.
- */
+// Toggle identity comes from the verified user, never the request body.
 app.post(
   "/api/saved-tuitions/toggle",
   verifyToken,
@@ -1502,7 +1300,7 @@ app.post(
         return res.json({ saved: false });
       }
 
-      // ফ্রি প্ল্যানে সর্বোচ্চ ৫টি বুকমার্ক — আনসেভ করতে কোনো সীমা নেই
+      // Free plan cap: 5 saves; unsaving is never capped.
       if (req.user.plan !== "pro") {
         const savedCount = await collections
           .savedTuitions()
@@ -1528,7 +1326,7 @@ app.post(
           .status(201)
           .json({ saved: true, _id: String(result.insertedId) });
       } catch (error) {
-        // Concurrent toggles: the unique index already made it saved.
+        // Duplicate key = concurrent save; already bookmarked.
         if (error?.code === 11000) return res.json({ saved: true });
         throw error;
       }
@@ -1538,11 +1336,8 @@ app.post(
   },
 );
 
-/* -------------------------------------------------------------------------- */
-/* Profile — /api/profile (any authenticated role, no role gate)              */
-/* -------------------------------------------------------------------------- */
+/* Profile — /api/profile (any authenticated role, no role gate) */
 
-/** Shape sent to the client: the editable tUserEdit fields + display context. */
 function toProfileDoc(user) {
   return {
     _id: String(user._id),
@@ -1557,7 +1352,6 @@ function toProfileDoc(user) {
   };
 }
 
-/** GET /api/profile — the caller's own document (phone/bio are not in the session). */
 app.get("/api/profile", verifyToken, async (req, res, next) => {
   try {
     const user = await collections
@@ -1570,14 +1364,7 @@ app.get("/api/profile", verifyToken, async (req, res, next) => {
   }
 });
 
-/**
- * PATCH /api/profile — update the caller's own profile.
- *
- * Identity always comes from `verifyToken` (`req.user.id`), never the body,
- * and only the whitelisted `tUserEdit` fields are written — so role/plan
- * cannot be escalated through this endpoint. A changed email is checked for
- * uniqueness (case-insensitive, excluding this user) before saving.
- */
+// PATCH /api/profile: DB identity + whitelisted fields only; role/plan cannot be escalated.
 app.patch("/api/profile", verifyToken, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -1601,7 +1388,7 @@ app.patch("/api/profile", verifyToken, async (req, res, next) => {
     const current = await users.findOne({ _id: userId });
     if (!current) return fail(res, 404, "User not found.");
 
-    // ইমেইল বদলালে অন্য অ্যাকাউন্টের সাথে কনফ্লিক্ট করতে পারবে না (case-insensitive)
+    // Changed email must not clash with another account (case-insensitive).
     if (email.toLowerCase() !== String(current.email || "").toLowerCase()) {
       const clash = await users.findOne({
         email: { $regex: `^${escapeRegExp(email)}$`, $options: "i" },
@@ -1629,14 +1416,11 @@ app.patch("/api/profile", verifyToken, async (req, res, next) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/* Admin — /api/admin                                                          */
-/* -------------------------------------------------------------------------- */
+/* Admin — /api/admin */
 
 const ROLES = ["student", "tutor", "admin"];
 const APPROVALS = ["approved", "rejected"];
 
-/** GET /api/admin/users — everyone registered on the platform. */
 app.get(
   "/api/admin/users",
   verifyToken,
@@ -1656,7 +1440,6 @@ app.get(
   },
 );
 
-/** PATCH /api/admin/users/:id/role — student | tutor | admin */
 app.patch(
   "/api/admin/users/:id/role",
   verifyToken,
@@ -1692,7 +1475,6 @@ app.patch(
   },
 );
 
-/** GET /api/admin/tuitions — every tuition post on the platform. */
 app.get(
   "/api/admin/tuitions",
   verifyToken,
@@ -1714,7 +1496,6 @@ app.get(
   },
 );
 
-/** PATCH /api/admin/tuitions/:id/approval — approved | rejected */
 app.patch(
   "/api/admin/tuitions/:id/approval",
   verifyToken,
@@ -1747,7 +1528,6 @@ app.patch(
   },
 );
 
-/** GET /api/admin/transactions — all Stripe payment records. */
 app.get(
   "/api/admin/transactions",
   verifyToken,
@@ -1769,17 +1549,8 @@ app.get(
   },
 );
 
-/* -------------------------------------------------------------------------- */
-/* Payments / Stripe                                                          */
-/* -------------------------------------------------------------------------- */
+/* Payments / Stripe */
 
-/**
- * POST /payments/checkout-verify — browser call from `/checkout/success`.
- *
- * Verifies the Checkout Session directly with Stripe (never trusts the client)
- * and converges on the same `syncProPlan()` write as the webhook, so whichever
- * arrives first activates Pro and the second is a no-op (`duplicate: true`).
- */
 app.post("/payments/checkout-verify", async (req, res, next) => {
   try {
     const sessionId = String(req.body?.sessionId ?? "").trim();
@@ -1817,16 +1588,12 @@ app.post("/payments/checkout-verify", async (req, res, next) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/* 404 + error fallbacks (registered after every route)                        */
-/* -------------------------------------------------------------------------- */
+/* 404 + error fallbacks (registered after every route) */
 
-// রাউট না পেলে
 app.use((_req, res) => {
   res.status(404).json({ message: "Route not found." });
 });
 
-// গ্লোবাল এরর হ্যান্ডলার
 app.use((err, _req, res, _next) => {
   console.error(err);
   res.status(err.status || 500).json({
@@ -1834,9 +1601,7 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-/* -------------------------------------------------------------------------- */
-/* Bootstrap                                                                   */
-/* -------------------------------------------------------------------------- */
+/* Bootstrap */
 
 const port = process.env.PORT || 5000;
 
