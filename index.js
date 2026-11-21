@@ -29,6 +29,7 @@
  *   DELETE /api/applications/:id     student: cancel a pending application
  *   GET    /api/profile              authenticated: full profile for the edit form
  *   PATCH  /api/profile              authenticated: update name/email/image/phone/bio
+ *   GET    /api/saved-tuitions       student: saved tuition list / saved ids / toggle
  *   POST   /payments/checkout-verify public: verify a Checkout Session + activate Pro
  *   POST   /payments/webhook         Stripe webhook (raw body, signature verified)
  *   /api/admin/*                     admin: users, tuitions, transactions
@@ -74,6 +75,7 @@ const collections = {
   tuitions: () => getDb().collection("tuitions"),
   applications: () => getDb().collection("applications"),
   payments: () => getDb().collection("payments"),
+  savedTuitions: () => getDb().collection("saveduitions"),
 };
 
 /* -------------------------------------------------------------------------- */
@@ -265,6 +267,20 @@ async function ensurePaymentIndexes() {
   } catch (error) {
     console.warn(
       `[payments] Could not create unique stripeSessionId index: ${error.message}`,
+    );
+  }
+}
+
+/** One bookmark per (student, tuition) — enforced by MongoDB, not just the API. */
+async function ensureSavedTuitionIndexes() {
+  try {
+    await collections.savedTuitions().createIndex(
+      { student: 1, tuition: 1 },
+      { unique: true, name: "uniq_saved_student_tuition" },
+    );
+  } catch (error) {
+    console.warn(
+      `[saveduitions] Could not create unique student+tuition index: ${error.message}`,
     );
   }
 }
@@ -744,6 +760,51 @@ function tutorSummary(tutorUser, tuition) {
   };
 }
 
+/**
+ * Hydrates saved-tuition docs into the same `tTuitionView` shape used by
+ * `GET /api/tuitions`, so the dashboard can reuse the existing card layout.
+ * Bookmarks pointing at deleted tuitions are silently dropped.
+ */
+async function withSavedTuitionDetails(savedDocs) {
+  const tuitionIds = [
+    ...new Set(savedDocs.map((doc) => doc.tuition).filter(Boolean)),
+  ];
+  const tuitions = tuitionIds.length
+    ? await collections
+        .tuitions()
+        .find({ _id: { $in: tuitionIds } })
+        .toArray()
+    : [];
+  const byId = new Map(tuitions.map((tuition) => [String(tuition._id), tuition]));
+
+  const tutorEmails = [
+    ...new Set(tuitions.map((tuition) => tuition.tutorEmail).filter(Boolean)),
+  ];
+  const tutorDocs = tutorEmails.length
+    ? await collections
+        .users()
+        .find(
+          { email: { $in: tutorEmails } },
+          { projection: { email: 1, name: 1, image: 1, bio: 1, plan: 1 } },
+        )
+        .toArray()
+    : [];
+  const tutorByEmail = new Map(tutorDocs.map((doc) => [doc.email, doc]));
+
+  return savedDocs.flatMap((saved) => {
+    const tuition = byId.get(String(saved.tuition));
+    if (!tuition) return [];
+    return [
+      {
+        ...tuition,
+        _id: String(tuition._id),
+        tutor: tutorSummary(tutorByEmail.get(tuition.tutorEmail), tuition),
+        savedAt: saved.createdAt ?? null,
+      },
+    ];
+  });
+}
+
 /** POST /api/tuitions — creates a post with approvalStatus: 'pending'. */
 app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
   try {
@@ -1019,6 +1080,8 @@ app.delete(
           { tuitionId: new ObjectId(tuition._id) },
         ],
       });
+      // বুকমার্কও ওই টিউশনের সাথে মুছে ফেলা হয় — ঝুলে থাকা রেফারেন্স থাকবে না
+      await collections.savedTuitions().deleteMany({ tuition: tuition._id });
 
       res.json({ message: "Tuition deleted successfully." });
     } catch (error) {
@@ -1283,6 +1346,111 @@ app.delete(
 
       await collections.applications().deleteOne({ _id });
       res.json({ message: "Application cancelled successfully." });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/* -------------------------------------------------------------------------- */
+/* Saved tuitions — /api/saved-tuitions (authenticated students)              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * GET /api/saved-tuitions/ids — just the saved tuition ids for the caller.
+ * Used on load so cards/details can render the active bookmarked state.
+ */
+app.get(
+  "/api/saved-tuitions/ids",
+  verifyToken,
+  verifyStudent,
+  async (req, res, next) => {
+    try {
+      const studentId = toObjectId(req.user.id);
+      if (!studentId) return fail(res, 400, "Invalid student account.");
+
+      const docs = await collections
+        .savedTuitions()
+        .find({ student: studentId }, { projection: { tuition: 1 } })
+        .toArray();
+
+      res.json({ savedIds: docs.map((doc) => String(doc.tuition)) });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * GET /api/saved-tuitions — the caller's bookmarks, newest first, in the same
+ * shape as GET /api/tuitions (plus `savedAt`). Deleted tuitions are filtered out.
+ */
+app.get(
+  "/api/saved-tuitions",
+  verifyToken,
+  verifyStudent,
+  async (req, res, next) => {
+    try {
+      const studentId = toObjectId(req.user.id);
+      if (!studentId) return fail(res, 400, "Invalid student account.");
+
+      const docs = await collections
+        .savedTuitions()
+        .find({ student: studentId })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json(await withSavedTuitionDetails(docs));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * POST /api/saved-tuitions/toggle — save or remove one bookmark.
+ * The identity comes from the verified user, never from the request body.
+ */
+app.post(
+  "/api/saved-tuitions/toggle",
+  verifyToken,
+  verifyStudent,
+  async (req, res, next) => {
+    try {
+      const studentId = toObjectId(req.user.id);
+      if (!studentId) return fail(res, 400, "Invalid student account.");
+
+      const tuitionId = toObjectId(req.body?.tuitionId);
+      if (!tuitionId) return fail(res, 400, "A valid tuitionId is required.");
+
+      const tuition = await collections.tuitions().findOne({ _id: tuitionId });
+      if (!tuition) return fail(res, 404, "Tuition not found.");
+
+      const saved = await collections
+        .savedTuitions()
+        .findOne({ student: studentId, tuition: tuitionId });
+
+      if (saved) {
+        await collections.savedTuitions().deleteOne({ _id: saved._id });
+        return res.json({ saved: false });
+      }
+
+      const now = new Date();
+      try {
+        const result = await collections.savedTuitions().insertOne({
+          student: studentId,
+          tuition: tuitionId,
+          createdAt: now,
+          updatedAt: now,
+        });
+        return res
+          .status(201)
+          .json({ saved: true, _id: String(result.insertedId) });
+      } catch (error) {
+        // Concurrent toggles: the unique index already made it saved.
+        if (error?.code === 11000) return res.json({ saved: true });
+        throw error;
+      }
     } catch (error) {
       next(error);
     }
@@ -1593,6 +1761,7 @@ const port = process.env.PORT || 5000;
 
 await connectToMongoDB();
 await ensurePaymentIndexes();
+await ensureSavedTuitionIndexes();
 
 app.listen(port, () => {
   console.log(`Server is running on port: ${port}`);
