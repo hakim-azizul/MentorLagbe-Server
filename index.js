@@ -124,11 +124,14 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Optional `limit` query param → MongoDB `.limit()` value (0 = unlimited). */
-function parseLimit(value) {
+/**
+ * Positive integer query param with a safe default and ceiling.
+ * Used by `GET /api/tuitions` for `page` and `limit`.
+ */
+function positiveInt(value, fallback, max) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.min(parsed, 100);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -506,6 +509,15 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    // Pagination metadata is also sent as headers for non-`meta=1` clients.
+    exposedHeaders: [
+      "X-Page",
+      "X-Limit",
+      "X-Total-Items",
+      "X-Total-Pages",
+      "X-Has-Next-Page",
+      "X-Has-Prev-Page",
+    ],
   }),
 );
 
@@ -877,16 +889,25 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res, next) => {
 
 /**
  * GET /api/tuitions — public catalogue of approved & active tuitions.
- * Filters: `search` (case-insensitive regex on title/subject), `subject`,
- * `classLevel`, `mode`. `limit` caps the result count (1–100, e.g. the home
- * page's `limit=6`). Sort: `sort` = newest | oldest | fee_asc | fee_desc
- * (default newest), applied in the database query. No auth required.
- * Every item carries a `tutor` profile summary (name, email, image, bio,
- * plan) from the `user` collection — same shape as GET /api/tuitions/:id.
+ * Filters: `search`, `subject`, `classLevel`, `mode`, `sort`.
+ * Pagination: `page` (default 1) and `limit` (default 12, max 50).
+ *
+ * The body stays a plain array for backwards compatibility (FeaturedTuitions
+ * calls `?limit=6`). `?meta=1` returns `{ items, ...pagination }` instead.
+ * The same metadata is always exposed as CORS-readable `X-*` headers.
  */
 app.get("/api/tuitions", async (req, res, next) => {
   try {
-    const { search, subject, classLevel, mode, sort, limit } = req.query;
+    const {
+      search,
+      subject,
+      classLevel,
+      mode,
+      sort,
+      page: pageQuery,
+      limit: limitQuery,
+      meta,
+    } = req.query;
 
     const filter = { approvalStatus: "approved", isActive: true };
 
@@ -903,11 +924,22 @@ app.get("/api/tuitions", async (req, res, next) => {
     const sortSpec =
       TUITION_SORTS[String(sort ?? "").trim()] || TUITION_SORTS.newest;
 
+    const limit = positiveInt(limitQuery, 12, 50);
+    const totalItems = await collections.tuitions().countDocuments(filter);
+    // Keep page 1 valid even for an empty catalogue.
+    const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+    const requestedPage = positiveInt(pageQuery, 1, Number.MAX_SAFE_INTEGER);
+    // Clamp an out-of-range page (e.g. stale ?page=9 after filtering) to the last page.
+    const page = Math.min(requestedPage, totalPages);
+    const hasNextPage = page < totalPages;
+    const hasPrevPage = page > 1;
+
     const tuitions = await collections
       .tuitions()
       .find(filter)
       .sort(sortSpec)
-      .limit(parseLimit(limit))
+      .skip((page - 1) * limit)
+      .limit(limit)
       .toArray();
 
     // টিউশনার ইউজার ডকুমেন্ট একটিই কোয়েরিতে — কার্ডে অ্যাভাটার/নাম দেখানোর জন্য
@@ -925,13 +957,33 @@ app.get("/api/tuitions", async (req, res, next) => {
       : [];
     const tutorByEmail = new Map(tutorDocs.map((doc) => [doc.email, doc]));
 
-    res.json(
-      tuitions.map((tuition) => ({
-        ...tuition,
-        _id: String(tuition._id),
-        tutor: tutorSummary(tutorByEmail.get(tuition.tutorEmail), tuition),
-      })),
-    );
+    const items = tuitions.map((tuition) => ({
+      ...tuition,
+      _id: String(tuition._id),
+      tutor: tutorSummary(tutorByEmail.get(tuition.tutorEmail), tuition),
+    }));
+    const pagination = {
+      page,
+      limit,
+      totalItems,
+      totalPages,
+      hasNextPage,
+      hasPrevPage,
+    };
+
+    res.set({
+      "X-Page": String(page),
+      "X-Limit": String(limit),
+      "X-Total-Items": String(totalItems),
+      "X-Total-Pages": String(totalPages),
+      "X-Has-Next-Page": String(hasNextPage),
+      "X-Has-Prev-Page": String(hasPrevPage),
+    });
+
+    if (String(meta ?? "") === "1") {
+      return res.json({ items, ...pagination });
+    }
+    res.json(items);
   } catch (error) {
     next(error);
   }
