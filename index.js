@@ -1169,7 +1169,8 @@ app.get("/api/applications/check", async (req, res, next) => {
 /**
  * POST /api/applications — student applies for a tuition.
  * The session cookie is not required: the applicant's role is verified against
- * the `user` collection using the submitted `studentEmail`.
+ * the `user` collection using the submitted `studentEmail`. The tuition is
+ * looked up so the stored application carries the tutor link (`tutorEmail`).
  */
 app.post("/api/applications", async (req, res, next) => {
   try {
@@ -1188,6 +1189,12 @@ app.post("/api/applications", async (req, res, next) => {
       return fail(res, 403, "Only students can apply for tuitions.");
     }
 
+    // টিউশন ডকুমেন্ট থেকে টিউটরের লিংক ও ডিসপ্লে তথ্য নেওয়া হয়
+    const tuition = await collections.tuitions().findOne({
+      _id: { $in: tuitionIdIn([tuitionId]) },
+    });
+    if (!tuition) return fail(res, 404, "Tuition not found.");
+
     // একই টিউশনে একজন শিক্ষার্থী একবারই আবেদন করতে পারবে
     const existing = await collections.applications().findOne({
       tuitionId: { $in: tuitionIdIn([tuitionId]) },
@@ -1200,6 +1207,11 @@ app.post("/api/applications", async (req, res, next) => {
     const appliedAt = new Date();
     const doc = {
       tuitionId,
+      tutorEmail: tuition.tutorEmail || "",
+      tutorName: tuition.tutorName || "",
+      tuitionTitle: tuition.title || "",
+      subject: tuition.subject || "",
+      monthlyFee: Number(tuition.monthlyFee || 0),
       studentName: String(body.studentName).trim(),
       studentEmail,
       studentPhone: String(body.phone).trim(),
@@ -1356,6 +1368,9 @@ app.delete(
 /* Saved tuitions — /api/saved-tuitions (authenticated students)              */
 /* -------------------------------------------------------------------------- */
 
+/** Free students get 5 bookmarks; Pro students are unlimited. */
+const FREE_SAVED_TUITION_LIMIT = 5;
+
 /**
  * GET /api/saved-tuitions/ids — just the saved tuition ids for the caller.
  * Used on load so cards/details can render the active bookmarked state.
@@ -1433,6 +1448,20 @@ app.post(
       if (saved) {
         await collections.savedTuitions().deleteOne({ _id: saved._id });
         return res.json({ saved: false });
+      }
+
+      // ফ্রি প্ল্যানে সর্বোচ্চ ৫টি বুকমার্ক — আনসেভ করতে কোনো সীমা নেই
+      if (req.user.plan !== "pro") {
+        const savedCount = await collections
+          .savedTuitions()
+          .countDocuments({ student: studentId });
+        if (savedCount >= FREE_SAVED_TUITION_LIMIT) {
+          return fail(
+            res,
+            403,
+            `Free students can save up to ${FREE_SAVED_TUITION_LIMIT} tuitions. Upgrade to Pro for unlimited bookmarks.`,
+          );
+        }
       }
 
       const now = new Date();
