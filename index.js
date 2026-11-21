@@ -1,6 +1,3 @@
-// MentorLagbe REST API — Express + MongoDB (MentorLagbeDb).
-// Routes are registered directly on `app`: setup -> auth -> domains -> fallbacks -> bootstrap.
-
 import "dotenv/config";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import express from "express";
