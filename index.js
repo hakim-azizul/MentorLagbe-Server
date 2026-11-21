@@ -978,7 +978,6 @@ const APPLICATION_FIELDS = [
   "tuitionId",
   "studentEmail",
   "studentName",
-  "phone",
   "preferredSchedule",
   "note",
 ];
@@ -999,6 +998,25 @@ async function withTuitionDetails(applications) {
     tuitions.map((tuition) => [String(tuition._id), tuition]),
   );
 
+  // Older applications may lack a phone — fall back to the student's profile.
+  const studentEmails = [
+    ...new Set(
+      applications
+        .map((app) => String(app.studentEmail ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+  const studentDocs = studentEmails.length
+    ? await collections
+        .users()
+        .find(
+          { email: { $in: studentEmails } },
+          { projection: { email: 1, phone: 1 } },
+        )
+        .toArray()
+    : [];
+  const studentByEmail = new Map(studentDocs.map((doc) => [doc.email, doc]));
+
   return applications.map((application) => {
     const tuition = byId.get(String(application.tuitionId));
     return {
@@ -1010,6 +1028,12 @@ async function withTuitionDetails(applications) {
       tutorName: tuition?.tutorName ?? application.tutorName ?? "",
       tutorEmail: tuition?.tutorEmail ?? application.tutorEmail ?? "",
       monthlyFee: tuition?.monthlyFee ?? application.monthlyFee ?? 0,
+      studentPhone:
+        String(application.studentPhone ?? "").trim() ||
+        studentByEmail.get(
+          String(application.studentEmail ?? "").trim().toLowerCase(),
+        )?.phone ||
+        "",
       appliedAt: application.appliedAt ?? application.createdAt ?? null,
       status: application.status || "pending",
     };
@@ -1054,6 +1078,15 @@ app.post("/api/applications", async (req, res, next) => {
       return fail(res, 403, "Only students can apply for tuitions.");
     }
 
+    // Phone comes from the profile; a short/missing number blocks applying.
+    const studentPhone = String(student.phone ?? "").trim();
+    if (studentPhone.length < 8) {
+      return res.status(422).json({
+        message:
+          "Please add a valid phone number (at least 8 characters) to your profile before applying.",
+      });
+    }
+
     // Tuition lookup supplies the tutor link and display fields.
     const tuition = await collections.tuitions().findOne({
       _id: { $in: tuitionIdIn([tuitionId]) },
@@ -1078,7 +1111,7 @@ app.post("/api/applications", async (req, res, next) => {
       monthlyFee: Number(tuition.monthlyFee || 0),
       studentName: String(body.studentName).trim(),
       studentEmail,
-      studentPhone: String(body.phone).trim(),
+      studentPhone,
       preferredSchedule: String(body.preferredSchedule).trim(),
       studentNote: String(body.note).trim(),
       status: "pending",
